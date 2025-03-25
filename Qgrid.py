@@ -150,5 +150,3 @@ if __name__ == "__main__":
     mps_tensor = three_grid.reshape_to_mps(T_quantics)
     print("Reshape 成 MPS 張量：")
     mps_tensor.print_diagram()
-
-    prr = RankRevealingLU(mps_tensor, 3)

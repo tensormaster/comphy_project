@@ -165,9 +165,40 @@ class TCI:
 
     
     def buildCube(self, data, dim1, dim2, dim3):
-        # 將數據重塑成一個 (dim1 x dim2 x dim3) 的 3D 張量
-        # 這裡可使用 numpy.reshape 或其他方法
-        return data  # 請根據實際需求實現
+        """
+        將提供的二維資料重塑為形狀為 (dim1, dim2, dim3) 的三維張量。
+        對應於 C++：arma::Cube(f_ptr, d1, d2, d3)。
+        
+        參數：
+            data：輸入的二維資料。若為 None，則會建立一個全零的張量。
+            dim1, dim2, dim3：三維張量的維度。
+        
+        傳回值：
+            一個重塑為 (dim1, dim2, dim3) 的 numpy ndarray。
+        """
+        # 確保維度皆為整數
+        try:
+            d1, d2, d3 = int(dim1), int(dim2), int(dim3)
+        except Exception as e:
+            raise ValueError("維度必須可轉換為整數。") from e
+
+        # 若 data 為 None，則建立一個全零張量
+        if data is None:
+            return np.zeros((d1, d2, d3))
+        
+        # 若輸入資料不是 numpy 陣列，則進行轉換
+        data_arr = np.array(data)
+        
+        # 檢查資料元素數是否符合預期維度大小
+        expected_size = d1 * d2 * d3
+        if data_arr.size != expected_size:
+            raise ValueError(
+                f"資料大小（{data_arr.size}）與預期形狀不符 "
+                f"（{d1} x {d2} x {d3}）= {expected_size} 個元素。"
+            )
+        
+        # 將資料重塑為三維張量
+        return data_arr.reshape((d1, d2, d3))
     
     def identityMatrix(self, size):
         # 返回一個 size x size 的單位矩陣

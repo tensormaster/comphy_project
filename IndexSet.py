@@ -53,6 +53,9 @@ class IndexSet:
 
     def __repr__(self):
         return f"IndexSet({self._indexes})"
+    def __len__(self):
+        """允許使用 len() 取得索引數量。"""
+        return len(self._indexes)
     
 if __name__ == "__main__":
     idx_set = IndexSet((0, 1), (1, 2), (2, 3), (0, 1))
