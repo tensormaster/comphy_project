@@ -3,7 +3,9 @@ import numpy as np
 import cytnx
 from cytnx import *
 from AdaptiveLU import AdaptiveLU
-
+import logging
+import numpy as np
+import cytnx
 # Initialize logging for debugging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -116,7 +118,7 @@ class CrossData:
         """
         k = self.rank()
         if self.cache['LD'] is None:
-            D_diag = cytnx.diag(self.lu.D[:k])
+            D_diag = cytnx.linalg.Diag(self.lu.D[:k])
             self.cache['LD'] = self.lu.L[:, :k] @ D_diag
             logger.debug("leftMat: Computed new left matrix (L * D).")
         else:
@@ -234,6 +236,7 @@ class CrossData:
         logger.debug(f"addPivotRow: Adding row {i} to R.")
         A = ensure_2d(A, axis=0)
         row = A[i, :]
+        logger.debug(f"[addPivotRow] Fetching row {i} from A, shape={A.shape()}")
         if self.R is None:
             self.R = row.reshape(1, self.n_cols)
             logger.debug(f"addPivotRow: Initialized R with shape {self.R.shape()}.")

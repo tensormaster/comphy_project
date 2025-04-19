@@ -3,198 +3,306 @@ from cytnx import *
 import numpy as np
 from IndexSet import IndexSet
 from Qgrid import QuanticGrid
+from AdaptiveLU import *
+from IndexSet import *
+from itertools import *
+from crossdata import *
+
+
+# 假設 CrossData, IndexSet, UniTensor 均已正確匯入
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+def contract_last_first(t1, t2):
+    """
+    將張量 t1 (形狀為 (a1, a2, ..., r)) 與 t2 (形狀為 (r, b1, b2, ..., b_k))
+    沿著 t1 的最後一個軸與 t2 的第一個軸做收縮，
+    回傳形狀為 (a1, a2, ..., b1, b2, ..., b_k) 的張量。
+    """
+    shape1 = t1.shape()  # 例如 (a1, a2, ..., r)
+    shape2 = t2.shape()  # 例如 (r, b1, b2, ..., b_k)
+    if shape1[-1] != shape2[0]:
+        raise ValueError(f"Contract dimensions do not match: {shape1[-1]} vs {shape2[0]}")
+    # 計算 t1 除最後一軸外的元素總數
+    m = 1
+    for s in shape1[:-1]:
+        m *= s
+    # t1 最後一軸長度 r
+    r = shape1[-1]
+    # 計算 t2 除第一軸外的元素總數
+    n2 = 1
+    for s in shape2[1:]:
+        n2 *= s
+    # 將 t1 reshape 為 (m, r)
+    t1_mat = t1.reshape(m, r)
+    # 將 t2 reshape 為 (r, n2)
+    t2_mat = t2.reshape(r, n2)
+    # 進行矩陣乘法（注意 cytnx.Tensor 支援 @ 運算符）
+    res_mat = t1_mat @ t2_mat
+    # 新張量形狀為 t1 除最後一軸加上 t2 除第一軸
+    new_shape = list(shape1[:-1]) + list(shape2[1:])
+    # 將乘法結果 reshape 回新形狀
+    res_tensor = res_mat.reshape(*new_shape)
+    return res_tensor
+
+def check_nan_in_tensor(core):
+    if core is None:
+        raise ValueError("核心張量為 None，請檢查分解過程。")
+    shape = core.shape()
+    if not shape:
+        return math.isnan(core.item())
+    for idx in product(*[range(s) for s in shape]):
+        try:
+            if math.isnan(core[idx].item()):
+                return True
+        except Exception as e:
+            raise RuntimeError(f"檢查張量元素 {idx} 時失敗：{e}")
+    return False
+
+
+def check_tensor_contents(t, name="Tensor"):
+    try:
+        arr = t.to_numpy()
+    except Exception as e:
+        raise ValueError(f"{name} 轉換成 numpy array 時失敗，可能內含非數值元素。") from e
+
+    it = np.nditer(arr, flags=['multi_index'])
+    while not it.finished:
+        elem = it[0]
+        if not isinstance(elem.item(), (int, float, np.number)):
+            raise TypeError(f"{name} 在索引 {it.multi_index} 內的元素型態 {type(elem.item())} 不正確。")
+        it.iternext()
+
+
+class TCI_env:
+    def __init__(self, tensor_data: 'Tensor', dim: int, M: int):
+        """
+        僅接受 tensor_data 作為來源的 TCI_env 類別。
+        """
+        if not isinstance(tensor_data, Tensor):
+            raise TypeError("tensor_data 必須是 cytnx.Tensor 物件")
+        if dim is None or M is None:
+            raise ValueError("提供 tensor_data 時，必須指定 dim 與 M")
+        self.dim = int(dim)
+        self.M = int(M)
+        self._tensor = tensor_data
+
+    def get_tensor(self):
+        return self._tensor
+
+    def get_quantics_tensor(self):
+        return UniTensor(self._tensor)
+
 
 class TCI:
-    def __init__(self, grid, tolerance=1e-6, verbose=True, max_iter=50, pivot1=None):
-        self.grid = grid
-        self.dim = grid.dim
+    def __init__(self, env, tolerance=1e-6, verbose=True, max_iter=50, pivot1=None):
+        if not hasattr(env, "dim") or not hasattr(env, "M"):
+            raise ValueError("TCI_env 物件必須具有 'dim' 與 'M' 屬性")
+        self.dim = int(env.dim)
+        self.M_value = int(env.M)
+        self.env = env
+
         self.tolerance = tolerance
         self.verbose = verbose
         self.max_iter = max_iter
+        self.localDim = [self.M_value for _ in range(self.dim)]
 
-        # 假設每個維度的大小皆為 grid.M
-        self.localDim = [grid.M for _ in range(self.dim)]
-        
-        # 1. 設置初始樞軸
-        if pivot1 is None:
-            # 如果未提供 pivot1，則設為全 0 向量，長度等於維數
-            self.pivot1 = [0] * self.dim
-            print(f"pivot 1 :",self.pivot1)
-        else:
-            self.pivot1 = pivot1
-        
-        # 評估函數 f 在 pivot1 處的值（假設 grid.f 為待近似的函數）
-        self.f = grid.f
-        initial_value = self.f(*self.pivot1)
+        self.pivot1 = [0] * self.dim if pivot1 is None else pivot1
+        if len(self.pivot1) != self.dim:
+            raise ValueError("初始 pivot 的長度必須與 dim 相同")
+        logger.info(f"使用初始 pivot: {self.pivot1}")
+
+        quantics_utensor = env.get_quantics_tensor()
+        if not hasattr(quantics_utensor, "get_block_"):
+            raise ValueError("env.get_quantics_tensor() 返回物件必須有 get_block_ 方法")
+        self.tensor_data = quantics_utensor.get_block_()
+        if not isinstance(self.tensor_data, Tensor):
+            raise TypeError("get_block_() 返回的物件必須為 cytnx.Tensor")
+
+        def safe_f(*idx):
+            try:
+                value = self.tensor_data[idx].item()
+            except Exception as e:
+                raise ValueError(f"無法讀取 tensor_data[{idx}]") from e
+            if not isinstance(value, (int, float)):
+                raise TypeError("f 返回值必須是數值型態")
+            return value
+
+        self.f = safe_f
+
+        try:
+            initial_value = self.f(*self.pivot1)
+        except Exception as e:
+            raise ValueError("計算初始 pivot 值失敗") from e
         self.pivotError = [abs(initial_value)]
         if self.pivotError[0] == 0.0:
-            raise ValueError("Not expecting f(pivot1)=0. Provide a better first pivot in the param")
-        
-        # 假設 self.dim 為維度數，self.localDim 為每個維度的大小，self.pivot1 為初始樞軸列表
-        # 建立一個列表，每個元素都是一個 IndexSet 物件
+            raise ValueError("初始 pivot f(pivot1) 為 0，不合法")
+
         self.localSet = [IndexSet() for _ in range(self.dim)]
         self.Iset = [IndexSet() for _ in range(self.dim)]
         self.Jset = [IndexSet() for _ in range(self.dim)]
-
         for p in range(self.dim):
-            # 填充 localSet[p]：每個可能的局部索引都要加入
             for i in range(self.localDim[p]):
-                # 注意這裡以 tuple 存放單一索引
                 self.localSet[p].push_back((i,))
-            
-            # 填充 Iset[p]：使用 pivot1 的前 p 個元素，轉成 tuple 後存入
             self.Iset[p].push_back(tuple(self.pivot1[:p]))
-            
-            # 填充 Jset[p]：使用 pivot1 從 p+1 開始的元素（也轉成 tuple）
             self.Jset[p].push_back(tuple(self.pivot1[p+1:]))
 
-        if self.verbose:
-            print("[Debug] localSet:", self.localSet)
-            print("[Debug] Iset:", self.Iset)
-            print("[Debug] Jset:", self.Jset)
-
-        # 3. 初始化樞軸矩陣、交叉資料、T3 張量與樞軸矩陣 P
-        # 這部分需要你依據具體算法實作
-        self.Pi_mat = []
-        self.Pi_bool = []
-        self.cross = []
-        self.T3 = [None] * self.dim  # 用來存放每個鍵上的 3D 張量
-        self.P = [None] * self.dim   # 存放每個鍵上的樞軸矩陣
-        
+        self.pi_matrices = []
+        self.pi_bool = []
+        self.cross_data_list = []
         for p in range(self.dim - 1):
-            # 建構第 p 個鍵的樞軸矩陣（需要實作 buildPiAt 方法）
             Pi = self.buildPiAt(p)
-            self.Pi_mat.append(Pi)
-            # 如有需要，建構對應的布林樞軸（例如過濾某些樞軸）
-            # self.Pi_bool.append(self.buildPiBoolAt(p))  # 如果條件函數存在
-            # 根據 Pi 的尺寸初始化 cross 結構（這裡僅示意）
-            cross_data = {"n_rows": Pi.n_rows, "n_cols": Pi.n_cols, "C": None, "R": None, "pivotMat": None}
-            self.cross.append(cross_data)
-        
+            self.pi_matrices.append(Pi)
+            cross_obj = CrossData(Pi.n_rows, Pi.n_cols)
+            self.cross_data_list.append(cross_obj)
+
+        self.T3 = [None] * self.dim
+        self.P = [None] * self.dim
         for p in range(self.dim - 1):
-            # 利用 cross[p] 更新 pivot 資訊，這裡假設有個 addPivot 方法
             self.addPivot(p)
-            # 建構 T3 張量：
-            # 如果 p==0，從 cross[p] 中取 C 部分來構造 T3[0]；否則從 R 部分構造 T3[p+1]
             if p == 0:
-                self.T3[p] = self.buildCube(self.cross[p]["C"], len(self.Iset[p]), len(self.localSet[p]), len(self.Jset[p]))
-            self.T3[p+1] = self.buildCube(self.cross[p]["R"], len(self.Iset[p+1]), len(self.localSet[p+1]), len(self.Jset[p+1]))
-            # 取得對應的樞軸矩陣
-            self.P[p] = self.cross[p].get("pivotMat", None)
-        
-        # 最後一個 P 設為 1x1 的單位矩陣
+                self.T3[p] = self.buildCube(self.cross_data_list[p].C,
+                                            len(self.Iset[p]), len(self.localSet[p]), len(self.Jset[p]))
+            self.T3[p+1] = self.buildCube(self.cross_data_list[p].R,
+                                          len(self.Iset[p+1]), len(self.localSet[p+1]), len(self.Jset[p+1]))
+            self.P[p] = self.cross_data_list[p].pivotMat()
         self.P[-1] = self.identityMatrix(1)
-        
-        # 4. 如有權重設定，可進行 TT 加權（這裡僅示意）
-        if hasattr(self, 'weight') and self.weight:
-            self.tt_sum = self.computeTTSum(self.get_TensorTrain(0), self.weight)
-        
-        # 5. 進行迭代更新以收斂近似（實作 iterate 方法）
+
         self.iterate(self.max_iter)
-    
+
+    def kron(self, index_set1, index_set2):
+        result = IndexSet()
+        for a, b in product(index_set1.get_all(), index_set2.get_all()):
+            result.push_back(a + b)
+        return result
+
     def buildPiAt(self, p):
-        """
-        為鍵 p 構建 Pi 矩陣：
-        行索引：由 Iset[p] 與 localSet[p] 組合而成，
-        - Iset[p] 表示從站點 0 到站點 p-1 的多索引集合，
-        - localSet[p] 表示站點 p 的局部索引集合。
-        列索引：由 localSet[p+1] 與 Jset[p+1] 組合而成，
-        - localSet[p+1] 表示站點 p+1 的局部索引集合，
-        - Jset[p+1] 表示從站點 p+2 到最後站點的多索引集合。
-        Pi 矩陣的元素定義為： f( i + a + b + j )，
-        其中 i 來自 Iset[p]，a 來自 localSet[p]，b 來自 localSet[p+1]，j 來自 Jset[p+1]。
-        """
-        # 建立行組合索引：對於每個 i ∈ Iset[p] 和 a ∈ localSet[p]，連接成一個 tuple
-        left_multi = []
-        for left in self.Iset[p].get_all():
-            for a in self.localSet[p].get_all():
-                left_multi.append(left + a)
-        
-        # 建立列組合索引：對於每個 b ∈ localSet[p+1] 和 j ∈ Jset[p+1]，連接成一個 tuple
-        right_multi = []
-        for b in self.localSet[p+1].get_all():
-            for right in self.Jset[p+1].get_all():
-                right_multi.append(b + right)
-        
-        n_rows = len(left_multi)
-        n_cols = len(right_multi)
-        Pi_matrix = np.zeros((n_rows, n_cols))
-        
-        # 計算每個矩陣元素：組合 left_multi 與 right_multi 後形成完整多索引，再計算 f(*full_index)
-        for i, left_index in enumerate(left_multi):
-            for j, right_index in enumerate(right_multi):
-                full_index = left_index + right_index  # full_index 的長度應等於 self.dim
+        left_set = self.kron(self.Iset[p], self.localSet[p])
+        right_set = self.kron(self.localSet[p+1], self.Jset[p+1])
+        n_rows = len(left_set.get_all())
+        n_cols = len(right_set.get_all())
+        Pi_matrix = zeros((n_rows, n_cols), dtype=Type.Double, device=Device.cpu)
+        for i, left_index in enumerate(left_set.get_all()):
+            for j, right_index in enumerate(right_set.get_all()):
+                full_index = left_index + right_index
                 Pi_matrix[i, j] = self.f(*full_index)
-        
-        # 用一個簡單的物件保存 Pi 矩陣及其相關資訊
-        Pi = type("PiMatrix", (), {})()  # 建立空物件
+        Pi = type("PiMatrix", (), {})()
         Pi.n_rows = n_rows
         Pi.n_cols = n_cols
         Pi.data = Pi_matrix
         return Pi
 
     def addPivot(self, p):
-        """
-        更新交叉數據 cross[p] 中的樞軸資訊：
-        根據 C++ 程式碼的邏輯，此處會取 Iset[p+1] 的第一個元素（左側樞軸）
-        與 Jset[p] 的第一個元素（右側樞軸），並在 Pi 矩陣中找到它們的位置，
-        然後將該樞軸值存入 cross[p]["pivotMat"]。
-        
-        此範例中為簡化起見，假設找到的位置均為 0。
-        真實實作中應重複 buildPiAt 的索引生成流程，比對並確定正確位置。
-        """
-        # 取得左側樞軸：來自 Iset[p+1]（若存在）
-        if self.Iset[p+1].get_all():
-            left_pivot = self.Iset[p+1].get_all()[0]
-        else:
-            left_pivot = ()
-        
-        # 取得右側樞軸：來自 Jset[p]（若存在）
-        if self.Jset[p].get_all():
-            right_pivot = self.Jset[p].get_all()[0]
-        else:
-            right_pivot = ()
-        
-        # 這裡應依照 buildPiAt 的行、列索引生成過程，找出 left_pivot 和 right_pivot 在 Pi 矩陣中所對應的位置。
-        # 為簡化，假設對應位置均為 0。
-        pivot_row = 0  # TODO: 根據 left_pivot 計算正確位置
-        pivot_col = 0  # TODO: 根據 right_pivot 計算正確位置
-        
-        # 將樞軸位置存入交叉數據，這裡以 1x1 矩陣形式表示
-        self.cross[p]["pivotMat"] = np.array([[self.Pi_mat[p].data[pivot_row, pivot_col]]])
+        A_tensor = self.pi_matrices[p].data
+        if not isinstance(A_tensor, Tensor):
+            raise TypeError("pi_matrices[p].data 必須是 cytnx.Tensor")
+        shape_list = A_tensor.shape()
+        n_rows, n_cols = shape_list
+        max_val = 0.0
+        pivot_i, pivot_j = 0, 0
+        # 掃描所有元素，找出絕對值最大的 pivot
+        for i in range(n_rows):
+            for j in range(n_cols):
+                try:
+                    value = A_tensor[i, j].item()
+                except Exception as e:
+                    raise ValueError(f"無法讀取 tensor_data[{i}, {j}]") from e
+                if abs(value) > max_val:
+                    max_val = abs(value)
+                    pivot_i, pivot_j = i, j
+        # 顯示 pivot 的實際數值與其在原始 tensor 的位置
+        pivot_value = A_tensor[pivot_i, pivot_j].item()
+        logger.info(f"addPivot: 選擇 Pivot 值 {pivot_value}，位置為 ({pivot_i}, {pivot_j})")
+        # 更新交叉資料
+        self.cross_data_list[p].addPivot(pivot_i, pivot_j, A_tensor)
 
-    
-    def buildCube(self, data, dim1, dim2, dim3):
-        # 將數據重塑成一個 (dim1 x dim2 x dim3) 的 3D 張量
-        # 這裡可使用 numpy.reshape 或其他方法
-        return data  # 請根據實際需求實現
-    
+
+    def buildCube(self, data, d1, d2, d3):
+        if data is None:
+            raise ValueError("buildCube 接收到 None")
+        expected_size = d1 * d2 * d3
+        total_elements = np.prod(data.shape())
+        if total_elements != expected_size:
+            raise ValueError(f"Tensor 大小 {total_elements} ≠ 預期大小 {expected_size}")
+        return data.reshape(d1, d2, d3)
+
     def identityMatrix(self, size):
-        # 返回一個 size x size 的單位矩陣
-        import numpy as np
-        return np.eye(size)
+        size_int = int(size)
+        if size_int <= 0:
+            raise ValueError("identityMatrix 參數需 > 0")
+        return eye(size_int, dtype=Type.Double, device=Device.cpu)
+
+    def iterate(self, nIter=1): 
+        nIter = int(nIter)
+        self.cIter = 0
+        self.pivotErrorLastIter = [1.0] * (self.dim - 1)
+        for t in range(nIter):
+            self.cIter += 1
+            logger.info(f"Starting iteration {self.cIter}")
+            if self.cIter == 1:
+                logger.info("First iteration skipped (initialization phase).")
+                continue
+            # 根據迭代次數決定處理 bond 的順序
+            pivot_order = range(self.dim - 1) if self.cIter % 2 == 0 else reversed(range(self.dim - 1))
+            for p in pivot_order:
+                logger.info(f"Iteration {self.cIter}, processing bond index {p}.")
+                self.addPivot(p)
+                err = cytnx.linalg.Norm(self.pi_matrices[p].data).item()
+                self.pivotErrorLastIter[p] = err
+                logger.info(f"Iteration {self.cIter}, bond {p} error: {err:.6e}")
+            max_err = max(self.pivotErrorLastIter)
+            self.pivotError.append(max_err)
+            logger.info(f"Iteration {self.cIter} completed. Max error: {max_err:.6e}")
+
+    def get_TensorTrain(self, mode=0):
+        tt = {"cores": self.T3, "pivots": self.P}
+        for idx, core in enumerate(tt["cores"]):
+            if core is None:
+                logger.error(f"T3[{idx}] 為 None")
+            if check_nan_in_tensor(core):
+                raise ValueError(f"Tensor core {idx} 含有 NaN")
+        return tt
+    def reconstruct_tt(self):
+        """
+        從 TT 的核心還原出完整張量，使用 cytnx.Tensor 的運算。
+        
+        假設每個核心形狀為 (r_{k-1}, n_k, r_k)，且第一個與最後一個維度均為 1，
+        還原後的張量形狀為 (n_1, n_2, ..., n_d)。
+        """
+        # 取第一個核心，若第一維為 1 則 squeeze 掉
+        res = self.T3[0]
+        shape = res.shape()
+        if shape[0] == 1:
+            res = res.reshape(*shape[1:])
+        # 依序對剩下的核心進行收縮，每次收縮 t1 最後一軸與 t2 第一軸
+        for core in self.T3[1:]:
+            res = contract_last_first(res, core)
+        # 如果最後一個維度為 1，則 squeeze 掉
+        final_shape = res.shape()
+        if final_shape[-1] == 1:
+            res = res.reshape(*final_shape[:-1])
+        return res
+
+    def compute_tt_error(self, tol):
+        """
+        計算原始張量與 TT 近似張量之間的相對誤差，並與指定容忍值比較。
+        
+        參數:
+          tol (float): 容忍的相對誤差
+          
+        回傳:
+          float: 相對誤差，計算方式為 ||original - reconstructed|| / ||original||
+        """
+        reconstructed = self.reconstruct_tt()
+        error_tensor = self.tensor_data - reconstructed
+        error_norm = cytnx.linalg.Norm(error_tensor).item()
+        original_norm = cytnx.linalg.Norm(self.tensor_data).item()
+        rel_error = error_norm / original_norm if original_norm != 0 else error_norm
+
+        if rel_error <= tol:
+            print(f"相對誤差 {rel_error:.6e} 在容忍值 {tol:.6e} 之內。")
+        else:
+            print(f"相對誤差 {rel_error:.6e} 超出容忍值 {tol:.6e}。")
+        return rel_error
     
-    def computeTTSum(self, tensorTrain, weight):
-        # 實現 TT 加權的計算
-        pass
-    
-    def get_TensorTrain(self, mode):
-        # 返回目前的 Tensor Train 近似（示意方法）
-        pass
-    
-    def iterate(self, nIter):
-        # 進行 nIter 次的迭代更新，逐步改善 TCI 近似
-        pass
 
 
-
-
-def f(x, y, z):
-    return np.exp(-x**2) + np.sin(x**2+y**2) + np.cos(y**2+z**2)
-
-def main():
-    grid = QuanticGrid(a=0, b=10, nBit=5, dim=3, fused=False, grid_method="uniform", f=f)
-    tci = TCI(grid, tolerance=1e-2, verbose=True, max_iter=5)
-
-if __name__ == "__main__":
-    main()

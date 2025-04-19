@@ -5,27 +5,36 @@ import numpy as np
 # 定義 IndexSet 類別（現有實現）
 # ---------------------------
 class IndexSet:
-    def __init__(self, *args):
-        """
-        初始化 IndexSet，可選參數作為初始索引逐個加入集合。
-        """
-        self._indexes = []         # 儲存索引的列表（保持順序）
-        self._index_set = set()      # 用於快速查重
-        for arg in args:
-            self.push_back(arg)
+    ##------修改區----------------####
+    def __init__(self, ids=None):
+        self._indexes = []
+        self._index_set = set()
+        if ids is not None:
+            for idx in ids:
+                self.push_back(idx)
 
     def push_back(self, index):
-            index_tuple = tuple(index)  # 將索引轉為元組
-            if index_tuple not in self._index_set:
-                self._indexes.append(index_tuple)
-                self._index_set.add(index_tuple)
+    # 如果 index 是可迭代，就做 tuple(index)；否則視為單一元素
+        try:
+            tup = tuple(index)
+        except TypeError:
+            tup = (index,)
+        if tup not in self._index_set:
+            self._indexes.append(index)
+            self._index_set.add(tup)
 
     def pos(self, index):
-            index_tuple = tuple(index)
-            try:
-                return self._indexes.index(index_tuple)
-            except ValueError:
-                return -1
+        """
+        如果 index 是 list/tuple，回傳各元素在 _indexes 中的索引列表；
+        否則回傳單一元素的位置。
+        """
+        if isinstance(index, (list, tuple)):
+            return [self._indexes.index(idx) for idx in index]
+        return self._indexes.index(index)
+
+    def from_int(self):
+        """回傳 _indexes 的淺複本。"""
+        return self._indexes.copy()
 
     def get_all(self):
         """返回內部所有索引的複製列表。"""
@@ -54,16 +63,38 @@ class IndexSet:
     def __repr__(self):
         return f"IndexSet({self._indexes})"
     
+    def __len__(self):
+        """允許使用 len() 取得索引數量。"""
+        return len(self._indexes)
+    
 if __name__ == "__main__":
-    idx_set = IndexSet((0, 1), (1, 2), (2, 3), (0, 1))
-    print(idx_set)
-    idx_set.push_back((0, 1,2))
-    print(idx_set)
-    print(idx_set.pos((1, 2)))
-    print(idx_set.pos((1, 3)))
-    print(idx_set.get_all())
+    # 建立初始 IndexSet，注意所有索引都必須為 tuple 格式
+    idx_set = IndexSet((0, 1), (1, 2), (2, 3), (0, 1))  # 重複的 (0,1) 會被排除
+    print("初始 idx_set：", idx_set)
+
+    # 加入新索引 (0, 1, 2)
+    idx_set.push_back((0, 1, 2))
+    print("加入 (0, 1, 2) 後：", idx_set)
+
+    # 查詢某個索引的索引位置
+    print("位置 pos((1, 2)) =", idx_set.pos((1, 2)))  # 存在，回傳 index
+    print("位置 pos((1, 3)) =", idx_set.pos((1, 3)))  # 不存在，應拋出 ValueError
+
+    # 列出所有索引
+    print("所有索引 =", idx_set.get_all())
+
+    # 建立另一個 IndexSet
     idx_set2 = IndexSet((1, 2), (2, 3), (3, 4))
-    print(idx_set.union(idx_set2))
-    print(idx_set.intersection(idx_set2))
+    print("idx_set2 =", idx_set2)
+
+    # 聯集
+    union_set = idx_set.union(idx_set2)
+    print("聯集 =", union_set)
+
+    # 交集
+    inter_set = idx_set.intersection(idx_set2)
+    print("交集 =", inter_set)
+
+    # 排序：依據每個 tuple 的第二個元素
     idx_set.sort(key=lambda x: x[1])
-    print(idx_set)
+    print("排序後的 idx_set =", idx_set)
