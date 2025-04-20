@@ -1,11 +1,13 @@
+# filename: crossdata.py (Corrected for NumPy index casting error)
+
 import logging
 import numpy as np
 import cytnx
 from cytnx import *
-from AdaptiveLU import AdaptiveLU
-import logging
-import numpy as np
-import cytnx
+from AdaptiveLU import AdaptiveLU # Assuming AdaptiveLU.py is available
+from typing import Optional
+import numpy as np # Ensure numpy is imported if used for array conversion
+
 # Initialize logging for debugging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -13,13 +15,6 @@ logger = logging.getLogger(__name__)
 def ensure_2d(t: Tensor, axis=0) -> Tensor:
     """
     Ensure the input Tensor is at least 2D. If 1D, reshape it based on the axis.
-    
-    Args:
-        t (Tensor): Input tensor.
-        axis (int): Axis to reshape along (0 for rows, 1 for columns).
-    
-    Returns:
-        Tensor: 2D tensor.
     """
     shape = t.shape()
     if len(shape) == 1:
@@ -32,355 +27,294 @@ def ensure_2d(t: Tensor, axis=0) -> Tensor:
         return t2
     return t
 
+# Using these custom functions now
 def manual_hstack(tensor1: cytnx.Tensor, tensor2: cytnx.Tensor) -> cytnx.Tensor:
     """
     Manually stack two tensors horizontally using basic cytnx operations.
-    
-    Args:
-        tensor1: First cytnx.Tensor with shape (m, n)
-        tensor2: Second cytnx.Tensor with shape (m, p)
-    
-    Returns:
-        cytnx.Tensor with shape (m, n + p)
     """
     m, n = tensor1.shape()
     p = tensor2.shape()[1]
     if tensor1.shape()[0] != tensor2.shape()[0]:
         raise ValueError("Tensors must have the same number of rows for horizontal stacking.")
-    result = cytnx.zeros((m, n + p))
+    result = cytnx.zeros((m, n + p), dtype=tensor1.dtype(), device=tensor1.device()) # Match dtype/device
     result[:, :n] = tensor1
     result[:, n:n + p] = tensor2
     logger.debug(f"manual_hstack: stacked tensors with shapes {tensor1.shape()} and {tensor2.shape()} to {result.shape()}")
-    logger.debug(f"manual_hstack: Result tensor content:\n{result}")
     return result
 
 def manual_vstack(tensor1: cytnx.Tensor, tensor2: cytnx.Tensor) -> cytnx.Tensor:
     """
     Manually stack two tensors vertically using basic cytnx operations.
-    
-    Args:
-        tensor1: First cytnx.Tensor with shape (m, n)
-        tensor2: Second cytnx.Tensor with shape (p, n)
-    
-    Returns:
-        cytnx.Tensor with shape (m + p, n)
     """
     m, n = tensor1.shape()
     p = tensor2.shape()[0]
     if tensor1.shape()[1] != tensor2.shape()[1]:
         raise ValueError("Tensors must have the same number of columns for vertical stacking.")
-    result = cytnx.zeros((m + p, n))
+    result = cytnx.zeros((m + p, n), dtype=tensor1.dtype(), device=tensor1.device()) # Match dtype/device
     result[:m, :] = tensor1
     result[m:m + p, :] = tensor2
     logger.debug(f"manual_vstack: stacked tensors with shapes {tensor1.shape()} and {tensor2.shape()} to {result.shape()}")
-    logger.debug(f"manual_vstack: Result tensor content:\n{result}")
     return result
 
 class CrossData:
     def __init__(self, n_rows: int, n_cols: int):
         """
         Initialize an empty CrossData instance.
-        
-        Args:
-            n_rows (int): Number of rows in the matrix.
-            n_cols (int): Number of columns in the matrix.
         """
         self.n_rows = n_rows
         self.n_cols = n_cols
-        self.C = None  # Column submatrix
-        self.R = None  # Row submatrix
-        self.lu = AdaptiveLU(n_rows, n_cols)  # Placeholder for AdaptiveLU
+        self.C = None
+        self.R = None
+        self.lu = AdaptiveLU(n_rows, n_cols)
         self.cache = {'LD': None, 'I_avail': None, 'J_avail': None}
         logger.debug(f"Initialized CrossData with {n_rows} rows and {n_cols} columns.")
 
-    def pivotMat(self) -> Tensor:
+    def pivotMat(self) -> Optional[Tensor]:
         """
-        Return the pivot matrix (rows of C corresponding to lu.Iset).
-        
-        Returns:
-            Tensor: Pivot matrix, or None if no pivots exist.
+        Return the pivot matrix A[Iset, Jset] (extracted from C or R).
         """
-        if self.C is None or not self.lu.Iset:
-            logger.debug("pivotMat: No pivot set found, returning None.")
+        if self.C is None or not isinstance(self.lu.Iset, (list, tuple)) or not self.lu.Iset or not isinstance(self.lu.Jset, (list, tuple)) or not self.lu.Jset:
+            logger.debug("pivotMat: No pivot set found or C/R is None, returning None.")
             return None
-        Iset_uvec = np.array(self.lu.Iset, dtype=np.uint32)
-        pivot_matrix = self.C[Iset_uvec, :]
-        logger.debug(f"pivotMat: Pivot matrix shape: {pivot_matrix.shape()}")
-        logger.debug(f"pivotMat: Pivot matrix content:\n{pivot_matrix}")
-        return pivot_matrix
+        Iset_indices = np.array(self.lu.Iset, dtype=np.uint32)
+        try:
+            if np.any(Iset_indices >= self.C.shape()[0]):
+                 logger.error(f"pivotMat: Iset indices {self.lu.Iset} out of bounds for C shape {self.C.shape()}")
+                 return None
+            pivot_matrix = self.C[Iset_indices, :]
+            logger.debug(f"pivotMat: Pivot matrix shape: {pivot_matrix.shape()}")
+            return pivot_matrix
+        except Exception as e:
+             logger.error(f"pivotMat: Unexpected error: {e}")
+             return None
 
-    def leftMat(self) -> Tensor:
-        """
-        Return the left matrix L * D (cached).
-        
-        Returns:
-            Tensor: Left matrix L * D.
-        """
+    def leftMat(self) -> Optional[Tensor]:
+        """ Return the left matrix L * D (cached). """
         k = self.rank()
-        if self.cache['LD'] is None:
-            D_diag = cytnx.linalg.Diag(self.lu.D[:k])
-            self.cache['LD'] = self.lu.L[:, :k] @ D_diag
-            logger.debug("leftMat: Computed new left matrix (L * D).")
-        else:
-            logger.debug("leftMat: Using cached left matrix.")
-        logger.debug(f"leftMat: Shape: {self.cache['LD'].shape()}")
-        logger.debug(f"leftMat: Matrix content:\n{self.cache['LD']}")
-        return self.cache['LD']
+        if k == 0: return None
+        if self.cache.get('LD') is None:
+            try:
+                if self.lu.D is None or self.lu.L is None: return None
+                if self.lu.D.shape()[0] < k or self.lu.L.shape()[1] < k: return None
+                D_diag = cytnx.linalg.Diag(self.lu.D[:k])
+                L_k = self.lu.L[:, :k]
+                if L_k.shape()[1] != k or D_diag.shape()[0] != k or D_diag.shape()[1] != k: return None
+                self.cache['LD'] = L_k @ D_diag
+                logger.debug("leftMat: Computed new left matrix (L * D).")
+            except Exception as e:
+                 logger.error(f"leftMat: Error computing L*D: {e}")
+                 self.cache['LD'] = None
+                 return None
+        if self.cache.get('LD') is not None: logger.debug(f"leftMat: Shape: {self.cache['LD'].shape()}")
+        return self.cache.get('LD')
 
-    def rightMat(self) -> Tensor:
-        """
-        Return the right matrix U.
-        
-        Returns:
-            Tensor: Right matrix U.
-        """
+    def rightMat(self) -> Optional[Tensor]:
+        """ Return the right matrix U. """
         k = self.rank()
-        logger.debug(f"rightMat: Shape: {self.lu.U.shape()}")
-        logger.debug(f"rightMat: Matrix content:\n{self.lu.U[:k, :]}")
-        return self.lu.U[:k, :]
+        if k == 0 or self.lu.U is None: return None
+        if self.lu.U.shape()[0] < k: return None
+        U_k = self.lu.U[:k, :]
+        if U_k.shape()[0] != k: return None
+        logger.debug(f"rightMat: Shape: {U_k.shape()}")
+        return U_k
 
     def availRows(self) -> list:
-        """
-        Return available row indices not yet in lu.Iset (cached).
-        
-        Returns:
-            list: List of available row indices.
-        """
-        if self.cache['I_avail'] is None:
-            self.cache['I_avail'] = [i for i in range(self.n_rows) if i not in self.lu.Iset]
-            logger.debug(f"availRows: Computed available rows: {self.cache['I_avail']}")
-        else:
-            logger.debug("availRows: Using cached available rows.")
-        return self.cache['I_avail']
+        """ Return available row indices not yet in lu.Iset (cached). """
+        if self.cache.get('I_avail') is None:
+            current_Iset = set(self.lu.Iset) if isinstance(self.lu.Iset, (list, tuple)) else set()
+            self.cache['I_avail'] = [i for i in range(self.n_rows) if i not in current_Iset]
+            logger.debug(f"availRows: Computed available rows: {len(self.cache['I_avail'])}")
+        return self.cache.get('I_avail', [])
 
     def availCols(self) -> list:
-        """
-        Return available column indices not yet in lu.Jset (cached).
-        
-        Returns:
-            list: List of available column indices.
-        """
-        if self.cache['J_avail'] is None:
-            self.cache['J_avail'] = [j for j in range(self.n_cols) if j not in self.lu.Jset]
-            logger.debug(f"availCols: Computed available columns: {self.cache['J_avail']}")
-        else:
-            logger.debug("availCols: Using cached available columns.")
-        return self.cache['J_avail']
+        """ Return available column indices not yet in lu.Jset (cached). """
+        if self.cache.get('J_avail') is None:
+            current_Jset = set(self.lu.Jset) if isinstance(self.lu.Jset, (list, tuple)) else set()
+            self.cache['J_avail'] = [j for j in range(self.n_cols) if j not in current_Jset]
+            logger.debug(f"availCols: Computed available columns: {len(self.cache['J_avail'])}")
+        return self.cache.get('J_avail', [])
 
     def rank(self) -> int:
-        """
-        Return the current rank of the decomposition.
-        
-        Returns:
-            int: Current rank.
-        """
-        current_rank = len(self.lu.Iset)
-        logger.debug(f"rank: Current rank is {current_rank}")
+        """ Return the current rank of the decomposition. """
+        current_rank = len(self.lu.Iset) if isinstance(self.lu.Iset, (list, tuple)) else 0
         return current_rank
 
     def firstPivotValue(self) -> float:
-        """
-        Return the value of the first pivot.
-        
-        Returns:
-            float: First pivot value, or 1.0 if no pivots exist.
-        """
-        if self.C is None or not self.lu.Iset:
-            logger.debug("firstPivotValue: No pivot found, returning 1.0")
+        """ Return the value of the first pivot. """
+        if self.C is None or not isinstance(self.lu.Iset, (list, tuple)) or not self.lu.Iset or not isinstance(self.lu.Jset, (list, tuple)) or not self.lu.Jset:
+            logger.debug("firstPivotValue: No valid pivot set found or C is None, returning 1.0")
             return 1.0
-        pivot_value = self.C[self.lu.Iset[0], 0].item()
-        logger.debug(f"firstPivotValue: First pivot value is {pivot_value}")
-        return pivot_value
+        try:
+             if self.lu.Iset[0] >= self.C.shape()[0]:
+                  logger.error(f"firstPivotValue: First pivot row index {self.lu.Iset[0]} out of bounds for C shape {self.C.shape()}.")
+                  return 1.0
+             pivot_value = self.C[self.lu.Iset[0], 0].item()
+             logger.debug(f"firstPivotValue: First pivot value is {pivot_value}")
+             return pivot_value
+        except Exception as e:
+             logger.error(f"firstPivotValue: Error getting pivot value: {e}")
+             return 1.0
 
     def eval(self, i: int, j: int) -> float:
-        """
-        Compute the approximate value at position (i, j).
-        
-        Args:
-            i (int): Row index.
-            j (int): Column index.
-        
-        Returns:
-            float: Approximate value at (i, j).
-        """
-        if self.C is None or self.R is None:
-            logger.debug(f"eval: Either C or R is None, returning 0.0 for position ({i}, {j})")
-            return 0.0
-        val = (self.leftMat()[i, :] @ self.rightMat()[:, j]).item()
-        logger.debug(f"eval: Evaluated value at ({i}, {j}) is {val}")
-        return val
+        """ Compute the approximate value at position (i, j) using A_approx = L @ D @ U. """
+        if self.rank() == 0: return 0.0
+        LD = self.leftMat()
+        U = self.rightMat()
+        if LD is None or U is None: return 0.0
+        try:
+             if i >= LD.shape()[0] or j >= U.shape()[1]: return 0.0
+             LD_row_i = LD[i, :]
+             U_col_j = U[:, j]
+             if LD_row_i.shape()[0] != U_col_j.shape()[0]: return 0.0
+             val = cytnx.linalg.Dot(LD_row_i, U_col_j).item()
+             return val
+        except Exception as e:
+             logger.error(f"eval: Error during evaluation at ({i},{j}): {e}")
+             return 0.0
 
-    def addPivot(self, i: int, j: int, A: cytnx.Tensor):
-        """
-        Update the cross data by adding a new pivot at position (i, j) of matrix A.
-        
-        Args:
-            i (int): Row index of the pivot.
-            j (int): Column index of the pivot.
-            A (Tensor): Input matrix.
-        """
-        logger.debug(f"addPivot: Adding pivot at position ({i}, {j}).")
-        A = ensure_2d(A, axis=0)
-        self.addPivotRow(i, A)
-        self.addPivotCol(j, A)
-        # Removed P and P_inv computation as they are not needed
-
+    # --- Restored Old addPivotRow/Col with manual stacking ---
     def addPivotRow(self, i: int, A: Tensor):
-        """
-        Add row i of matrix A to R and update lu.
-        
-        Args:
-            i (int): Row index to add.
-            A (Tensor): Input matrix.
-        """
-        logger.debug(f"addPivotRow: Adding row {i} to R.")
+        """ Add row i of matrix A to R and update lu. """
+        logger.debug(f"addPivotRow: Adding row {i} using full matrix A.")
         A = ensure_2d(A, axis=0)
-        row = A[i, :]
-        logger.debug(f"[addPivotRow] Fetching row {i} from A, shape={A.shape()}")
+        try: row = A[i, :]
+        except IndexError:
+            logger.error(f"addPivotRow: Row index {i} out of bounds for matrix A with shape {A.shape()}.")
+            return
+        logger.debug(f"[addPivotRow] Extracted row {i} from A, shape={row.shape()}")
+        row_2d = row.reshape(1, self.n_cols)
         if self.R is None:
-            self.R = row.reshape(1, self.n_cols)
+            self.R = row_2d.clone()
             logger.debug(f"addPivotRow: Initialized R with shape {self.R.shape()}.")
         else:
-            row_2d = row.reshape(1, self.n_cols)
-            self.R = manual_vstack(self.R, row_2d)
+            self.R = manual_vstack(self.R, row_2d) # Use custom vstack
             logger.debug(f"addPivotRow: Updated R, new shape: {self.R.shape()}.")
         self.lu.add_pivot_row(i, row)
         self.cache = {'LD': None, 'I_avail': None, 'J_avail': None}
-        logger.debug(f"addPivotRow: Current R content:\n{self.R}")
 
     def addPivotCol(self, j: int, A: Tensor):
-        """
-        Add column j of matrix A to C and update lu.
-        
-        Args:
-            j (int): Column index to add.
-            A (Tensor): Input matrix.
-        """
-        logger.debug(f"addPivotCol: Adding column {j} to C.")
+        """ Add column j of matrix A to C and update lu. """
+        logger.debug(f"addPivotCol: Adding column {j} using full matrix A.")
         A = ensure_2d(A, axis=0)
-        col = A[:, j]
+        try: col = A[:, j]
+        except IndexError:
+             logger.error(f"addPivotCol: Column index {j} out of bounds for matrix A with shape {A.shape()}.")
+             return
+        logger.debug(f"[addPivotCol] Extracted col {j} from A, shape={col.shape()}")
+        col_2d = col.reshape(self.n_rows, 1)
         if self.C is None:
-            self.C = col.reshape(self.n_rows, 1)
+            self.C = col_2d.clone()
             logger.debug(f"addPivotCol: Initialized C with shape {self.C.shape()}.")
         else:
-            col_2d = col.reshape(self.n_rows, 1)
-            self.C = manual_hstack(self.C, col_2d)
+            self.C = manual_hstack(self.C, col_2d) # Use custom hstack
             logger.debug(f"addPivotCol: Updated C, new shape: {self.C.shape()}.")
         self.lu.add_pivot_col(j, col)
         self.cache = {'LD': None, 'I_avail': None, 'J_avail': None}
-        logger.debug(f"addPivotCol: Current C content:\n{self.C}")
 
+    # --- Restored addPivot convenience method ---
+    def addPivot(self, i: int, j: int, A: cytnx.Tensor):
+        """ Update the cross data by adding a new pivot at position (i, j) of matrix A. """
+        logger.debug(f"addPivot: Adding pivot at position ({i}, {j}).")
+        self.addPivotRow(i, A)
+        self.addPivotCol(j, A)
+
+    # --- Other methods ---
     def mat(self) -> Tensor:
-        Aapprox = self.lu.reconstruct()
-        logger.debug(f"mat: Approximated matrix shape: {Aapprox.shape()}")
-        logger.debug(f"mat: Approximated matrix content:\n{Aapprox}")
-        return Aapprox
+        """ Reconstruct the approximated matrix A_approx = L @ D @ U """
+        logger.debug("mat: Reconstructing matrix using lu object.")
+        if self.rank() == 0:
+             return cytnx.zeros((self.n_rows, self.n_cols))
+        try:
+            Aapprox = self.lu.reconstruct()
+            if Aapprox.shape() != [self.n_rows, self.n_cols]:
+                 logger.warning(f"mat: Reconstructed shape {Aapprox.shape()} differs from expected ({self.n_rows},{self.n_cols}).")
+                 return cytnx.zeros((self.n_rows, self.n_cols))
+            logger.debug(f"mat: Approximated matrix shape: {Aapprox.shape()}")
+            return Aapprox
+        except Exception as e:
+            logger.error(f"mat: Error during lu.reconstruct: {e}")
+            return cytnx.zeros((self.n_rows, self.n_cols))
 
-    def setRows(self, C_new: cytnx.Tensor, P: list):
-        """
-        Increase the rows of the matrix according to C_new, reordering old rows per P.
-        
-        Args:
-            C_new (Tensor): New column submatrix.
-            P (list): Permutation of old row indices.
-        """
-        logger.debug("setRows: Setting new rows and reordering according to permutation P.")
-        self.n_rows = C_new.shape[0]
-        self.lu.Iset = [P[i] for i in self.lu.Iset]
-        L_reordered = self.lu.L[P, :]
-        new_L = cytnx.zeros((self.n_rows, self.lu.L.shape[1]))
-        new_L[:len(P), :] = L_reordered
-        Pc = [i for i in range(self.n_rows) if i not in P]
-        for k in range(self.lu.rank()):
-            new_L[Pc, k] = C_new[Pc, k]
-            for l in range(k):
-                new_L[Pc, k] -= new_L[Pc, l] * (self.lu.U[l, self.lu.Jset[k]].item() * self.lu.D[l].item())
-        self.lu.L = new_L
-        self.C = C_new
-        self.cache = {'LD': None, 'I_avail': None, 'J_avail': None}
-        logger.debug(f"setRows: Updated C content:\n{self.C}")
-
-    def setCols(self, R_new: cytnx.Tensor, Q: list):
-        """
-        Increase the columns of the matrix according to R_new, reordering old columns per Q.
-        
-        Args:
-            R_new (Tensor): New row submatrix.
-            Q (list): Permutation of old column indices.
-        """
-        logger.debug("setCols: Setting new columns and reordering according to permutation Q.")
-        self.n_cols = R_new.shape[1]
-        self.lu.Jset = [Q[j] for j in self.lu.Jset]
-        U_reordered = self.lu.U[:, Q]
-        new_U = cytnx.zeros((self.lu.U.shape[0], self.n_cols))
-        new_U[:, :len(Q)] = U_reordered
-        Qc = [j for j in range(self.n_cols) if j not in Q]
-        for k in range(self.lu.rank()):
-            new_U[k, Qc] = R_new[k, Qc]
-            for l in range(k):
-                new_U[k, Qc] -= (self.lu.L[self.lu.Iset[k], l].item() * self.lu.D[l].item()) * new_U[l, Qc]
-        self.lu.U = new_U
-        self.R = R_new
-        self.cache = {'LD': None, 'I_avail': None, 'J_avail': None}
-        logger.debug(f"setCols: Updated R content:\n{self.R}")
-
-    def reconstruct(self):
-        if self.rank > 0:
-            K = self.rank
-            D_diag = cytnx.linalg.Diag(self.D[:K])  # Use only the first K elements
-            return self.L[:, :K] @ D_diag @ self.U[:K, :]
-        else:
-            return cytnx.zeros((self.n_rows, self.n_cols), dtype=Type.Double, device=Device.cpu)
-        
 # Test script
 if __name__ == "__main__":
+    logger.setLevel(logging.INFO)
     logger.debug("Starting debug of CrossData with random matrix.")
-    M, N = 3, 3
+    M, N = 5, 4
     np.random.seed(0)
-    arr = np.random.rand(M, N)
+    arr = np.random.rand(M, N) * 10
+    arr[1, 2] += 50
     A = from_numpy(arr)
-    logger.debug("Original matrix A:")
-    logger.debug(f"Matrix content:\n{A}")
-    logger.debug(f"Input A dtype: {A.dtype()}, shape: {A.shape()}")
+    logger.info("Original matrix A:")
+    logger.info(f"Matrix content:\n{A}")
 
     cross_data = CrossData(M, N)
-    logger.debug("Adding pivots and tracking approximation error:")
-    for _ in range(min(A.shape()[0], A.shape()[1])):
-        # Compute current approximation and residual
-        Aapprox = cross_data.mat()  # Uses self.lu.reconstruct() internally
+    logger.info("Adding pivots and tracking approximation error:")
+    MAX_RANK_TO_ADD = min(M, N)
+    for k in range(MAX_RANK_TO_ADD):
+        logger.info(f"--- Iteration {k+1} ---")
+        Aapprox = cross_data.mat()
         residual = A - Aapprox
 
-        # Mask already selected rows and columns
-        for i_used in cross_data.lu.Iset:
-            residual[i_used, :] = 0
-        for j_used in cross_data.lu.Jset:
-            residual[:, j_used] = 0
+        current_Iset = set(cross_data.lu.Iset) if isinstance(cross_data.lu.Iset, (list, tuple)) else set()
+        current_Jset = set(cross_data.lu.Jset) if isinstance(cross_data.lu.Jset, (list, tuple)) else set()
 
-        # Find the maximum absolute value in the residual
-        abs_residual = cytnx.linalg.Abs(residual)
-        flat_residual = abs_residual.reshape(-1)  # Flatten to 1D
-        max_idx = 0
-        max_val = flat_residual[0].item()
-        for idx in range(1, flat_residual.shape()[0]):
-            val = flat_residual[idx].item()
-            if val > max_val:
-                max_val = val
-                max_idx = idx
+        mask = cytnx.ones(residual.shape(), dtype=residual.dtype(), device=residual.device())
 
-        # Convert 1D index back to 2D coordinates
-        N = abs_residual.shape()[1]  # Number of columns
-        i = max_idx // N
-        j = max_idx % N
+        # --- Fix for Masking using Iteration ---
+        if current_Iset:
+            iset_indices = list(current_Iset) # Use list directly
+            for idx in iset_indices:
+                if 0 <= idx < mask.shape()[0]: # Check bounds
+                    mask[idx, :] = 0.0 # Assign 0.0 (float)
+        if current_Jset:
+            jset_indices = list(current_Jset) # Use list directly
+            for idx in jset_indices:
+                 if 0 <= idx < mask.shape()[1]: # Check bounds
+                    mask[:, idx] = 0.0 # Assign 0.0 (float)
+        # --- End Fix ---
 
-        # Add the pivot
+        masked_residual = residual * mask
+        abs_residual = cytnx.linalg.Abs(masked_residual)
+        if abs_residual.shape()[0] == 0 or abs_residual.shape()[1] == 0: break
+        flat_residual = abs_residual.reshape(-1)
+        if flat_residual.shape()[0] == 0: break
+
+        max_val = -1.0
+        max_idx = -1
+        if flat_residual.shape()[0] > 0:
+             temp_max_val = -1.0
+             temp_max_idx = -1
+             for idx in range(flat_residual.shape()[0]):
+                 val = flat_residual[idx].item()
+                 if val > temp_max_val:
+                      temp_max_val = val
+                      temp_max_idx = idx
+             max_val = temp_max_val
+             max_idx = temp_max_idx
+
+        if max_idx == -1 or max_val < 1e-14:
+            logger.info(f"Max residual value {max_val:.2e} below tolerance or not found, stopping.")
+            break
+
+        num_cols_res = abs_residual.shape()[1]
+        if num_cols_res == 0: break
+        i = max_idx // num_cols_res
+        j = max_idx % num_cols_res
+
+        logger.info(f"Found pivot at ({i}, {j}) with residual value {residual[i,j].item():.4f} (max abs masked residual: {max_val:.4f})")
         cross_data.addPivot(i, j, A)
+        logger.info(f"Rank after adding: {cross_data.rank()}")
 
+    logger.info("--- Final Results ---")
     final_approx_matrix = cross_data.mat()
     final_error_matrix = A - final_approx_matrix
-    max_error = final_error_matrix.Abs().Max().item()
+    max_error = 0.0
+    if final_error_matrix.shape()[0] > 0 and final_error_matrix.shape()[1] > 0 :
+         max_error = final_error_matrix.Abs().Max().item()
 
-    logger.debug(f"Final maximum absolute error: {max_error:.6e}")
-    logger.debug("Final approximated matrix:")
-    logger.debug(f"Matrix content:\n{final_approx_matrix}")
-    logger.debug("Original matrix:")
-    logger.debug(f"Matrix content:\n{A}")
+    logger.info(f"Final Rank: {cross_data.rank()}")
+    logger.info(f"Final maximum absolute error: {max_error:.6e}")
+    logger.info("Final approximated matrix:")
+    logger.info(f"Matrix content:\n{final_approx_matrix}")
+    logger.info("Original matrix:")
+    logger.info(f"Matrix content:\n{A}")
