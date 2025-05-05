@@ -10,11 +10,11 @@ from dataclasses import dataclass, field
 
 # Assuming these modules are accessible
 from IndexSet import IndexSet
-from matrix_interface import IMatrix, IMatrixIndex, MatDenseIndex, MatLazyIndex, make_IMatrix
+from matrix_interface import IMatrix, IMatrixIndex, MatDenseIndex, MatLazyIndex
 from crossdata import CrossData # Assumes modified addPivotRow/Col accepting vectors
 from pivot_finder import PivotFinder, PivotFinderParam, PivotData
 from AdaptiveLU import AdaptiveLU # Assuming AdaptiveLU is used by CrossData
-
+from comphy_project.tensorfuc import CytnxTensorFunction
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -32,6 +32,7 @@ class TensorCIParam:
     weights: Optional[List[cytnx.Tensor]] = None # For environment learning
     cond: Optional[Callable[[MultiIndex], bool]] = None
     pi_matrix_dense: bool = True # Use MatDenseIndex for Pi matrices
+    use_function_cache: bool = True # Use function cache for f_raw
 
 # Helper function to combine multi-indices
 def combine_multi_indices(set1: IndexSet, set2: IndexSet) -> IndexSet:
@@ -64,6 +65,7 @@ class TensorCI:
     """
     def __init__(self, f: Callable[[MultiIndex], float], local_dims: List[int], param: TensorCIParam = TensorCIParam()):
         self.f_raw = f
+        self.f = CytnxTensorFunction(f, use_cache=param.use_function_cache)
         self.param = param
         self.local_dims = local_dims
         self.L = len(local_dims) # Number of sites
@@ -89,7 +91,9 @@ class TensorCI:
         self.pivot_error_last_iter: List[float] = [1.0] * (self.L - 1)
         self.cIter: int = 0 # Iteration counter
 
-        self.tt_env = None # Initialize environment attribute
+                # --- Environment Initialization (if weights provided) ---
+        self.L_env: Optional[List[Optional[cytnx.Tensor]]] = None
+        self.R_env: Optional[List[Optional[cytnx.Tensor]]] = None
         if self.param.weights:
             if len(self.param.weights) != self.L:
                  logger.error("Length of weights must match number of sites. Disabling environment learning.")
@@ -101,7 +105,8 @@ class TensorCI:
                 # --- Calculate initial L_env ---
                 # L_env[0] is scalar 1 (represented as a rank-0 tensor or tensor with shape [1])
                 L_env_0_np = np.array([1.0], dtype=np.float64)
-                self.L_env[0] = cytnx.from_numpy(L_env_0_np).to(cytnx.Device.cpu) # FIXED
+                self.L_env[0] = cytnx.from_numpy(np.array([1.0], dtype=np.float64)).to(cytnx.Device.cpu)
+                self.R_env[self.L] = cytnx.from_numpy(np.array([1.0], dtype=np.float64)).to(cytnx.Device.cpu)
                 for p in range(self.L):
                     Mp = self._get_TP1_at(p) if p < self.L -1 else self.T3[p] # Use TP1 or T3 for M_p
                     wp = self.param.weights[p] # Weight for site p (expected shape [sp])
@@ -287,7 +292,7 @@ class TensorCI:
                  raise
 
         # Create the appropriate matrix interface instance
-        return make_IMatrix(pi_func, I_combined.from_int(), J_combined.from_int(), self.param.pi_matrix_dense)
+        return IMatrix(pi_func, I_combined.from_int(), J_combined.from_int(), self.param.pi_matrix_dense)
 
 
     def _build_pivot_finder_at(self, p: int) -> PivotFinder:
@@ -410,8 +415,9 @@ class TensorCI:
             pi_col_vals = self.Pi_mat[p].submat(list(range(self.Pi_mat[p].n_rows)), [pivot_data.j])
             pi_row_np = np.array(pi_row_vals, dtype=np.float64)
             pi_col_np = np.array(pi_col_vals, dtype=np.float64)
-            pi_row_vec = cytnx.from_numpy(pi_row_np) # FIXED
-            pi_col_vec = cytnx.from_numpy(pi_col_np) # FIXED
+            pi_row_vec = cytnx.from_numpy(pi_row_np)
+            pi_col_vec = cytnx.from_numpy(pi_col_np)
+
             # Ensure correct shapes for addPivotRow/Col
             pi_row_vec = pi_row_vec.reshape(1, -1)
             pi_col_vec = pi_col_vec.reshape(-1, 1)
@@ -715,8 +721,8 @@ class TensorCI:
                   # Extract row/col vectors using new Pi_mat
                   pi_row_vals = self.Pi_mat[p].submat([pi_i], list(range(self.Pi_mat[p].n_cols)))
                   pi_col_vals = self.Pi_mat[p].submat(list(range(self.Pi_mat[p].n_rows)), [pi_j])
-                  pi_row_vec = cytnx.from_numpy(np.array(pi_row_vals, dtype=np.float64)).reshape(1,-1) # FIXED
-                  pi_col_vec = cytnx.from_numpy(np.array(pi_col_vals, dtype=np.float64)).reshape(-1,1) # FIXED
+                  pi_row_vec = cytnx.from_numpy(np.array(pi_row_vals, dtype=np.float64)).reshape(1,-1)
+                  pi_col_vec = cytnx.from_numpy(np.array(pi_col_vals, dtype=np.float64)).reshape(-1,1)
                   # Add pivot using the new indices and vectors
                   self.cross[p].addPivotRow(pi_i, pi_row_vec)
                   self.cross[p].addPivotCol(pi_j, pi_col_vec)
@@ -748,8 +754,8 @@ class TensorCI:
                 # Extract row/col vectors using new Pi_mat
                 pi_row_vals = self.Pi_mat[p].submat([pi_i], list(range(self.Pi_mat[p].n_cols)))
                 pi_col_vals = self.Pi_mat[p].submat(list(range(self.Pi_mat[p].n_rows)), [pi_j])
-                pi_row_vec = cytnx.Tensor(pi_row_vals, device=cytnx.Device.cpu).astype(cytnx.Type.Double).reshape(1,-1)
-                pi_col_vec = cytnx.Tensor(pi_col_vals, device=cytnx.Device.cpu).astype(cytnx.Type.Double).reshape(-1,1)
+                pi_row_vec = cytnx.from_numpy(np.array(pi_row_vals, dtype=np.float64)).reshape(1,-1) # FIXED
+                pi_col_vec = cytnx.from_numpy(np.array(pi_col_vals, dtype=np.float64)).reshape(-1,1) # FIXED
                 # Add pivot using the new indices and vectors
                 self.cross[p].addPivotRow(pi_i, pi_row_vec)
                 self.cross[p].addPivotCol(pi_j, pi_col_vec)
@@ -833,161 +839,95 @@ class TensorCI:
         if len(final_mps) != self.L:
             logger.warning(f"Tensor train construction incomplete: {len(final_mps)}/{self.L} tensors created.")
         return final_mps
-
 if __name__ == "__main__":
-    import itertools
     import time
 
-    # --- Test Case: 1D Ising Model Partition Function ---
-    # Z = Sum_{s_1,...,s_L} exp(-beta * E(s_1,...,s_L))
-    # E = -J * Sum_{i} s_i * s_{i+1} - h * Sum_{i} s_i  (s_i = +/- 1)
-    # Map state {0, 1} -> spin {-1, 1}: spin = 2*state - 1
+    # --- Simple Test Case: Product function ---
+    # f(x0, x1, x2) = (x0+1)*(x1+1)*(x2+1)
 
-    L = 8       # Number of sites (increase slightly for better test)
-    D = 2       # Local dimension (0 or 1)
-    J = 1.0     # Coupling
-    h = 0.1     # External field (make it non-zero)
-    beta = 0.5  # Inverse temperature
+    # Set logging level to INFO to reduce output
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__) # Apply level to the logger used in the class
 
+    L = 3 # Number of sites
+    D = 2 # Local dimension (0 or 1) -> small domain
     local_dims = [D] * L
 
-    # Cache for function evaluations (useful for expensive functions)
-    FUNC_CACHE = {}
     FUNC_CALL_COUNT = 0
-
-    def ising_energy(spins: Tuple[int, ...]) -> float:
-        """ Calculates energy for a spin configuration tuple (+/- 1). """
-        E = 0.0
-        for i in range(L - 1):
-            E -= J * spins[i] * spins[i+1]
-        for i in range(L):
-            E -= h * spins[i]
-        return E
-
-    def ising_config_weight(idx: MultiIndex) -> float:
-        """ Calculates the Boltzmann weight e^(-beta*E) for a state index (0/1). """
+    def simple_product_func(idx: MultiIndex) -> float:
+        """ Calculates (x0+1)*(x1+1)*(x2+1) """
         global FUNC_CALL_COUNT
-        # Ensure idx is a tuple of integers
+        FUNC_CALL_COUNT += 1
+        # Ensure idx is tuple of ints
         try:
-            # Handle potential single-element tuples from IndexSet
             idx_int = tuple(int(i[0]) if isinstance(i, tuple) else int(i) for i in idx)
             if len(idx_int) != L: raise ValueError("Index length mismatch")
         except Exception as e:
             logger.error(f"Invalid index format: {idx}. Error: {e}")
             return 0.0
+        val = 1.0
+        for i in idx_int:
+            val *= (i + 1.0)
+        return float(val)
 
-        # Use cache
-        idx_key = idx_int
-        if idx_key in FUNC_CACHE:
-            return FUNC_CACHE[idx_key]
+    logger.info(f"Testing Simple Product Function: L={L}, D={D}")
 
-        FUNC_CALL_COUNT += 1
-        spins = tuple(2 * i - 1 for i in idx_int)
-        energy = ising_energy(spins)
-        weight = math.exp(-beta * energy)
-        result = float(weight)
-        FUNC_CACHE[idx_key] = result
-        # logger.debug(f"ising_config_weight({idx_int}) -> spins={spins}, E={energy:.4f}, weight={result:.4e}")
-        return result
-
-    logger.info(f"Testing 1D Ising Model: L={L}, J={J}, h={h}, beta={beta}")
-
-    # --- Common Params ---
-    tci_iter = L * 3 # More sweeps might be needed
-    tci_reltol = 1e-8
-    tci_pivot = [0] * L
-    tci_piv_param = PivotFinderParam(full_piv=False, n_rook_iter=5)
-    use_lazy_pi = True # <<< Definitely recommend True for efficiency
-
-    # --- Function to run and time TCI ---
-    def run_tci(params, name):
-        global FUNC_CACHE, FUNC_CALL_COUNT
-        FUNC_CACHE = {} # Clear cache for each run
-        FUNC_CALL_COUNT = 0
-        logger.info(f"\n--- Running TCI {name} ---")
-        start_time = time.time()
-        try:
-            tci = TensorCI(ising_config_weight, local_dims, params)
-            mps = tci.get_tensor_train(center=L//2)
-        except Exception as e:
-            logger.error(f"TCI Run ({name}) failed: {e}", exc_info=True)
-            return None, [], 0, 0.0
-        end_time = time.time()
-        run_time = end_time - start_time
-        logger.info(f"TCI Run ({name}) completed in {run_time:.2f} seconds.")
-        logger.info(f"Function call count for {name}: {FUNC_CALL_COUNT}")
-        logger.info(f"Final Max Error per Iteration ({name}): {tci.pivot_error}")
-        return mps, tci.pivot_error, FUNC_CALL_COUNT, run_time
-
-    # --- Run TCI without Weights ---
-    params_no_weights = TensorCIParam(
-        n_iter=tci_iter, reltol=tci_reltol, pivot1=tci_pivot,
-        pivot_finder_param=tci_piv_param, pi_matrix_dense=(not use_lazy_pi)
+    # --- TCI Parameters ---
+    # <<< Set pi_matrix_dense to False for efficiency! >>>
+    params = TensorCIParam(
+        n_iter = 5, # Fewer iterations needed for simple function
+        reltol = 1e-10,
+        pivot1 = [0] * L, # Start with (0,0,0)
+        pivot_finder_param = PivotFinderParam(full_piv=False, n_rook_iter=3),
+        pi_matrix_dense = False # <<< Use Lazy Evaluation!
     )
-    mps_no_weights, errors_nw, calls_nw, time_nw = run_tci(params_no_weights, "without weights")
 
-    # --- Run TCI with Weights ---
-    uniform_weights = [cytnx.ones(D, dtype=cytnx.Type.Double, device=cytnx.Device.cpu) for _ in range(L)]
-    params_with_weights = TensorCIParam(
-        n_iter=tci_iter, reltol=tci_reltol, pivot1=tci_pivot,
-        pivot_finder_param=tci_piv_param, weights=uniform_weights,
-        pi_matrix_dense=(not use_lazy_pi)
-    )
-    mps_with_weights, errors_w, calls_w, time_w = run_tci(params_with_weights, "with weights")
+    # --- Run TCI ---
+    logger.info("\n--- Running TCI ---")
+    start_time = time.time()
+    try:
+        tci = TensorCI(simple_product_func, local_dims, params)
+        mps_tensors = tci.get_tensor_train(center=L//2)
+    except Exception as e:
+        logger.error(f"TCI Run failed: {e}", exc_info=True)
+        mps_tensors = []
+    end_time = time.time()
+    logger.info(f"TCI Run completed in {end_time - start_time:.3f} seconds.")
+    logger.info(f"Function call count: {FUNC_CALL_COUNT}")
+    logger.info(f"Final Max Error per Iteration: {tci.pivot_error}")
 
-    # --- Calculate Exact Partition Function ---
-    Z_exact = 0.0
-    FUNC_CACHE = {} # Clear cache before exact calculation
-    if L <= 16:
-        logger.info("\nCalculating exact partition function...")
-        start_exact = time.time()
-        all_configs = list(itertools.product([0, 1], repeat=L))
-        Z_exact = sum(ising_config_weight(config) for config in all_configs)
-        end_exact = time.time()
-        logger.info(f"Exact Z = {Z_exact:.8f} (calculated in {end_exact-start_exact:.2f} s)")
-    else: logger.info("\nExact partition function calculation skipped (L > 16).")
+    # --- Basic Verification ---
+    logger.info("\n--- Verification ---")
+    final_ranks = []
+    if mps_tensors and len(mps_tensors) == L:
+        final_ranks = [mps_tensors[p].shape()[2] for p in range(L - 1)]
+        logger.info(f"Final Bond dimensions: {final_ranks}")
 
-    # --- Calculate Z from MPS ---
-    def calculate_Z_from_mps(mps: List[cytnx.Tensor], name: str):
-        if not mps or len(mps) != L or not all(isinstance(m, cytnx.Tensor) for m in mps):
-            logger.error(f"MPS ({name}) invalid for Z calculation.")
-            return float('nan')
+        # Check one value, e.g., f(1,1,1) = (1+1)*(1+1)*(1+1) = 8
+        test_idx = tuple([D - 1] * L) # e.g., (1, 1, 1) if D=2
+        true_val = simple_product_func(test_idx)
+        logger.info(f"Checking index {test_idx}, True value = {true_val}")
+
         try:
-            env = cytnx.ones(1, dtype=mps[0].dtype(), device=mps[0].device())
+            # Contract MPS
+            vec = cytnx.ones(1, dtype=mps_tensors[0].dtype(), device=mps_tensors[0].device())
             for p in range(L):
-                M = mps[p]
-                M_summed = cytnx.linalg.Sum(M, axes=[1])
-                env = env.reshape(1, -1) @ M_summed
-                env = env.reshape(-1)
-            Z_mps = env.item()
-            logger.info(f"MPS ({name}) Z = {Z_mps:.8f}")
-            if Z_exact > 1e-15:
-                rel_err = abs(Z_exact - Z_mps) / Z_exact
-                logger.info(f"  Relative Error = {rel_err:.4e}")
-            return Z_mps
+                M = mps_tensors[p]
+                idx_p = test_idx[p]
+                if not (0 <= idx_p < M.shape()[1]):
+                     raise IndexError(f"Physical index {idx_p} out of bounds for M[{p}] shape {M.shape()}")
+                # Contract env [r_p] with M[:, idx_p, :] [r_p, r_{p+1}]
+                vec = vec.reshape(1, -1) @ M[:, idx_p, :]
+                vec = vec.reshape(-1)
+            approx_val = vec.item()
+            logger.info(f"MPS approximated value = {approx_val:.8f}")
+            if abs(true_val) > 1e-14:
+                rel_err = abs(true_val - approx_val) / abs(true_val)
+                logger.info(f"Relative Error = {rel_err:.4e}")
+            else:
+                 logger.info(f"Absolute Error = {abs(true_val - approx_val):.4e}")
+
         except Exception as e:
-            logger.error(f"Error contracting MPS ({name}): {e}", exc_info=True)
-            return float('nan')
-
-    logger.info("\n--- Comparing Results ---")
-    z_nw = calculate_Z_from_mps(mps_no_weights, "No Weights")
-    z_w = calculate_Z_from_mps(mps_with_weights, "With Weights")
-
-    # --- Log Final Ranks ---
-    def get_ranks(mps):
-        if not mps or len(mps) != L or not all(isinstance(m, cytnx.Tensor) for m in mps): return []
-        # Handle potential shape issues if MPS construction failed partially
-        ranks = []
-        for p in range(L - 1):
-             try: ranks.append(mps[p].shape()[2])
-             except: ranks.append(-1) # Indicate error or missing tensor
-        return ranks
-
-    logger.info(f"Final Bond dimensions (No Weights): {get_ranks(mps_no_weights)}")
-    logger.info(f"Final Bond dimensions (With Weights): {get_ranks(mps_with_weights)}")
-
-    logger.info(f"\n--- Summary ---")
-    logger.info(f"Run Time (No Weights): {time_nw:.2f} s")
-    logger.info(f"Run Time (With Weights): {time_w:.2f} s")
-    logger.info(f"Function Calls (No Weights): {calls_nw}")
-    logger.info(f"Function Calls (With Weights): {calls_w}")
+             logger.error(f"Error during MPS contraction for verification: {e}", exc_info=True)
+    else:
+        logger.error("MPS construction failed or incomplete. Cannot verify.")
