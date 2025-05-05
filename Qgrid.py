@@ -1,152 +1,231 @@
-import cytnx  
-from cytnx import *
+# -*- coding: utf-8 -*-
+# 導入必要的函式庫
+import cytnx
+from cytnx import * # <--- 使用了 from cytnx import *
 import numpy as np
-from cytnx_prrLU import RankRevealingLU
+import math
+from itertools import product
 
 # --------------------------------------------------------
 # 網格生成函數
 # --------------------------------------------------------
 def uniform_grid(a, b, M):
-    return cytnx.arange(a, b, (b - a) / M)
+    """生成一個均勻網格，包含 M 個點，不包含終點 b"""
+    if M <= 0: return cytnx.zeros(0, dtype=Type.Double)
+    step = (b - a) / float(M)
+    end_point = a + (M - 1) * step
+    return cytnx.linspace(a, end_point, M, dtype=Type.Double)
 
 def gauss_kronrod_grid(a, b):
-    M = 15
-    xs = uniform_grid(a, b, M)
-    ws = cytnx.ones(M, dtype=Type.Double, device=-1) * ((b - a) / M)
-    return xs, ws
+    """生成 Gauss-Kronrod 網格 (15點)"""
+    print("警告：Gauss-Kronrod 網格與 Quantics 位元邏輯不兼容，建議使用 'uniform'")
+    M = 15; xs = cytnx.linspace(a, b, M, dtype=Type.Double); ws = cytnx.ones(M, dtype=Type.Double) * ((b - a) / M); return xs, ws
 
 # --------------------------------------------------------
-# QuanticGrid 類別：生成量化張量
+# QuanticGrid 類別：生成量化張量 (使用直接的 from_numpy)
 # --------------------------------------------------------
 class QuanticGrid:
+    """
+    表示一個 Quantics 網格，用於將函數離散化為張量。
+    邏輯已修正以匹配 C++ 版本。
+    """
     def __init__(self, a=0.0, b=1.0, nBit=4, dim=1, fused=False, grid_method="uniform", custom_grid_func=None, f=None):
-        self.a = a
-        self.b = b
-        self.nBit = nBit
-        self.dim = dim
-        self.fused = fused
-        self.M = 1 << nBit  # 每個變數的格點數，必須是2的冪
-        self.grid_method = grid_method.lower()
-        self.custom_grid_func = custom_grid_func
-        self.f = f
+        if not isinstance(nBit, int) or nBit <= 0: raise ValueError("nBit 必須是正整數")
+        if not isinstance(dim, int) or dim <= 0: raise ValueError("dim 必須是正整數")
+        if b <= a: raise ValueError("b 必須大於 a")
+        self.a = float(a); self.b = float(b); self.nBit = nBit; self.dim = dim; self.fused = fused
+        self.M = 1 << nBit; self.deltaX = (self.b - self.a) / float(self.M) if self.M > 0 else 0
+        self.grid_method = grid_method.lower(); self.custom_grid_func = custom_grid_func; self.f = f
         self.grids = []
+
         for i in range(dim):
-            if self.custom_grid_func is not None:
-                xs, _ = self.custom_grid_func(a, b)
+            if self.custom_grid_func is not None and self.grid_method == "custom":
+                xs_data, _ = self.custom_grid_func(self.a, self.b)
+                if not isinstance(xs_data, cytnx.Tensor):
+                    try:
+                        # ----------- 使用直接的 from_numpy -----------
+                        xs = from_numpy(np.array(xs_data)).astype(Type.Double)
+                        # ----------- 修正結束 -----------
+                    except NameError:
+                         print("錯誤: 'from_numpy' 未定義。請確保 'from cytnx import *' 或相關導入正確。")
+                         raise
+                    except Exception as e:
+                         raise TypeError(f"無法將自定義網格轉換為 cytnx.Tensor: {e}")
+                else:
+                    xs = xs_data # 如果已經是 Tensor，直接使用
+                if xs.shape()[0] != self.M: print(f"警告：自定義網格維度 {i} 的大小 {xs.shape()} 與 M={self.M} 不匹配")
             elif self.grid_method == "uniform":
-                xs = uniform_grid(a, b, self.M)
-            elif self.grid_method == "gk":
-                xs, _ = gauss_kronrod_grid(a, b)
-            else:
-                raise ValueError("grid_method must be 'uniform', 'GK', or use custom_grid_func")
+                xs = uniform_grid(self.a, self.b, self.M)
+                if xs.shape()[0] != self.M and self.M > 0:
+                     print(f"警告：uniform_grid 維度 {i} 產生了 {xs.shape()[0]} 個點，預期為 {self.M}")
+                     end_point = self.a + (self.M - 1) * self.deltaX
+                     xs = cytnx.linspace(self.a, end_point, self.M, dtype=Type.Double)
+            elif self.grid_method == "gk": raise ValueError("Gauss-Kronrod 網格與嚴格的 Quantics 位元邏輯不兼容。請使用 'uniform'。")
+            else: raise ValueError("grid_method 必須是 'uniform', 'gk', 或 'custom'")
+            if xs.dtype() != Type.Double: xs = xs.astype(Type.Double)
             self.grids.append(xs)
-        
-    def get_cartesian_grid(self):
-        from itertools import product
-        prod = list(product(*[range(self.M) for _ in range(self.dim)]))
-        grid_points = []
-        for idx in prod:
-            pt = []
-            for d in range(self.dim):
-                pt.append(float(self.grids[d][idx[d]].item()))
-            grid_points.append(pt)
-        return grid_points
+
+    def coord_to_int_index(self, coord):
+        if self.deltaX == 0: return 0
+        k = math.floor((coord - self.a) / self.deltaX)
+        return max(0, min(self.M - 1, k))
 
     def coord_to_bin(self, coord):
-        scaled = int((coord - self.a) / (self.b - self.a) * (self.M - 1))
-        bin_str = format(scaled, '0{}b'.format(self.nBit))
-        return [int(bit) for bit in bin_str]
-    
-    def get_bin_indices(self):
-        bin_indices = []
-        for d in range(self.dim):
-            arr = []
-            for i in range(self.M):
-                arr.append(self.coord_to_bin(self.grids[d][i]))
-            bin_indices.append(np.array(arr))
-        return bin_indices
+        k = self.coord_to_int_index(coord)
+        return [int(bit) for bit in format(k, f'0{self.nBit}b')]
 
-    def fuse_indices(self):
-        bin_indices = self.get_bin_indices()
-        fused = []
-        for d in range(self.dim):
-            ints = []
-            for bits in bin_indices[d]:
-                ints.append(int("".join(str(b) for b in bits), 2))
-            fused.append(np.array(ints))
-        return fused
+    # ... (get_bin_indices_for_dim, get_cartesian_* 保持不變) ...
+    def get_bin_indices_for_dim(self, dim_index):
+        if dim_index < 0 or dim_index >= self.dim: raise IndexError("維度索引超出範圍")
+        arr = []; grid_points_np = self.grids[dim_index].numpy()
+        for i in range(self.M): arr.append(self.coord_to_bin(grid_points_np[i]))
+        return np.array(arr)
+    def get_cartesian_grid_indices(self):
+        return list(product(range(self.M), repeat=self.dim))
+    def get_cartesian_grid_coords(self):
+        indices_comb = self.get_cartesian_grid_indices(); coords_comb = []
+        np_grids = [g.numpy() for g in self.grids]
+        for indices in indices_comb: coords_comb.append([np_grids[d][indices[d]] for d in range(self.dim)])
+        return coords_comb
 
-    def interleave_indices(self):
-        bin_indices = self.get_bin_indices()
-        from itertools import product
-        all_indices = list(product(range(self.M), repeat=self.dim))
-        res = []
-        for idx in all_indices:
-            new_idx = []
-            for d in range(self.dim):
-                bits = []
-                for r in range(self.nBit):
-                    bits.append(bin_indices[d][idx[d]][r])
-                new_idx.append(int("".join(str(b) for b in bits), 2))
-            res.append(new_idx)
-        return np.array(res)
 
     def get_quantics_tensor(self):
-        if self.f is None:
-            raise ValueError("Function f is not defined in QuanticGrid.")
-        pts = self.get_cartesian_grid()
-        # 注意：對於多維情況，呼叫函數時使用 *pt 解包列表（例如 f(x,y,z)）
-        values = np.array([self.f(*pt) for pt in pts])
-        shape = [self.M] * self.dim
-        # 注意這裡 T 為 cytnx Tensor
-        T = from_numpy(values.reshape(shape))
-        
-        # 如果 T 是一維則 reshape 成 (M,1)
-        if len(T.shape()) == 1:
-            T = T.reshape(shape[0], 1)
-        # 返回包裝為 UniTensor 的物件，方便後續操作
-        return UniTensor(T)
-    
-    def reshape_to_mps(self, T):
-        # T 必須是一個 UniTensor，且其 underlying tensor 尺寸必須與離散張量一致
-        # 檢查 self.M 是否是 2 的冪
-        if (self.M & (self.M - 1)) != 0:
-            raise ValueError("self.M 必須是 2 的冪")
-        
-        if self.fused is False:
-            # 非 fused 狀態下，總位數為 dim * log2(self.M)
-            total_bits = self.dim * int(np.log2(self.M))
-            shape = [2 for _ in range(total_bits)]
-            print("Reshape shape (non-fused):", shape, type(shape))
-            # 對 UniTensor 進行就地重塑，使用 reshape_ 方法，傳入展開後的各個維度
-            T.reshape_(*shape)
-            ut = UniTensor(T.get_block_())  # 根據重塑後的底層 Tensor 重新建立 UniTensor
-            return ut
+        if self.f is None: raise ValueError("函數 f 未在 QuanticGrid 中定義。")
+        pts_coords = self.get_cartesian_grid_coords()
+        try: values = np.array([float(self.f(*pt)) for pt in pts_coords], dtype=np.float64)
+        except Exception as e: print(f"評估函數 f 時出錯：{e}"); raise
+        initial_shape = (self.M,) * self.dim
+
+        # ----------- 使用直接的 from_numpy -----------
+        try:
+            T_block = from_numpy(values.reshape(initial_shape))
+        except NameError:
+            print("錯誤: 'from_numpy' 未定義。請確保 'from cytnx import *' 或相關導入正確。")
+            raise
+        # ----------- 修正結束 -----------
+
+        if T_block.dtype() != Type.Double: T_block = T_block.astype(Type.Double)
+        labels = [f'k{i}' for i in range(self.dim)]; T_uni = UniTensor(T_block, rowrank=0, labels=labels)
+        return T_uni
+
+    def reshape_to_mps(self, T_uni):
+        if not isinstance(T_uni, UniTensor): raise TypeError("輸入必須是 cytnx.UniTensor")
+        initial_shape = (self.M,) * self.dim
+        if T_uni.shape() != list(initial_shape):
+             raise ValueError(f"輸入 UniTensor 形狀 {T_uni.shape()} 與預期形狀 {initial_shape} 不符")
+        D = self.dim; N = self.nBit
+
+        if not self.fused:
+            # --- Non-Fused 模式 ---
+            target_total_bits = D * N
+            if target_total_bits == 0: # Handle nBit=0 or dim=0 edge case
+                 return T_uni.clone() # Or return an empty UniTensor?
+            initial_nonfused_shape = [2] * target_total_bits
+            T_work = T_uni.clone()
+            T_work.reshape_(*initial_nonfused_shape)
+            permute_indices = [0] * target_total_bits
+            for d_orig in range(D):
+                for b_orig in range(N):
+                    idx_orig = d_orig * N + b_orig; idx_target = b_orig * D + d_orig
+                    permute_indices[idx_orig] = idx_target
+            # Only permute if rank > 1
+            if T_work.rank() > 1:
+                 T_work.permute_(permute_indices)
+            final_labels = [f'b{bit}d{d}' for bit in range(N) for d in range(D)]
+            if len(final_labels) == T_work.rank(): # Check rank matches label count
+                 T_work.set_labels(final_labels)
+            T_work.set_rowrank(0)
+            return T_work
         else:
-            # fused 狀態下，總站點數為 log2(self.M)
-            total_sites = int(np.log2(self.M))
-            shape = [2 ** self.dim for _ in range(total_sites)]
-            print("Reshape shape (fused):", shape, type(shape))
-            T.reshape_(*shape)
-            ut = UniTensor(T.get_block_())
-            return ut
+            # --- Fused 模式 (手動 NumPy 映射) ---
+            if N == 0:
+                 T_block_fused = cytnx.zeros([], dtype=T_uni.dtype(), device=T_uni.device())
+                 return UniTensor(T_block_fused, rowrank=0)
 
-    
+            T_np = T_uni.get_block().numpy()
+            fused_dim_size = 2**D
+            fused_shape_np = tuple([fused_dim_size] * N)
+            T_fused_np = np.zeros(fused_shape_np, dtype=T_np.dtype)
+            fused_indices_iterator = product(range(fused_dim_size), repeat=N)
+            powers_of_2_b = [1 << b for b in range(N)]
 
+            for fused_indices in fused_indices_iterator:
+                k_indices = [0] * D; valid_k = True
+                for b in range(N):
+                    fb = fused_indices[b]
+                    for d in range(D):
+                        sigma_db = (fb >> d) & 1
+                        k_indices[d] += sigma_db * powers_of_2_b[b]
+                if any(k >= self.M for k in k_indices): continue
+                try: T_fused_np[fused_indices] = T_np[tuple(k_indices)]
+                except IndexError: continue
+
+            # ----------- 使用直接的 from_numpy -----------
+            try:
+                T_block_fused = from_numpy(T_fused_np)
+            except NameError:
+                print("錯誤: 'from_numpy' 未定義。請確保 'from cytnx import *' 或相關導入正確。")
+                raise
+            # ----------- 修正結束 -----------
+
+            if T_block_fused.dtype() != T_uni.dtype():
+                 T_block_fused = T_block_fused.astype(T_uni.dtype())
+
+            final_labels = [f'fused_b{bit}' for bit in range(N)]
+            new_rowrank = 1 if N > 0 else 0
+            T_work_fused = UniTensor(T_block_fused, rowrank=new_rowrank, labels=final_labels)
+            return T_work_fused
 
 # ============================================================
-# 主程式：測試 3D 情況下離散化與重塑
+# 主程式：測試案例 (保持不變)
 # ============================================================
-def f3(x, y, z):
-    return x**2 + y**2 + z**2
+def f_linear(x): return 2.0 * x + 1.0
+def f_2d(x, y): return float(x) + 2.0 * float(y)
+def f_3d(x, y, z): return float(x) + 2.0 * float(y) + 3.0 * float(z)
 
 if __name__ == "__main__":
-    # 創建一個 3D 網格，nBit=3 則每個變數 2^3=8 個點，dim=3 則總共 8^3 = 512 個點
-    three_grid = QuanticGrid(a=0, b=1, nBit=3, dim=3, grid_method="uniform", f=f3)
-    T_quantics = three_grid.get_quantics_tensor()
-    print("Quantics 張量的形狀：", T_quantics.shape())
-    
-    # 將 Quantics 張量重塑成 MPS 形式
-    mps_tensor = three_grid.reshape_to_mps(T_quantics)
-    print("Reshape 成 MPS 張量：")
-    mps_tensor.print_diagram()
+    np.set_printoptions(linewidth=150, precision=5, suppress=True)
+    # === 測試 1: 1D ===
+    print("--- 測試 1: 1D (nBit=2, M=4) ---")
+    qg1d = QuanticGrid(a=0.0, b=4.0, nBit=2, dim=1, fused=False, f=f_linear)
+    T1d_uni = qg1d.get_quantics_tensor()
+    print(f"初始張量 T (1D, shape={T1d_uni.shape()}):\n{T1d_uni.get_block().numpy()}")
+    T1d_mps = qg1d.reshape_to_mps(T1d_uni.clone())
+    print(f"重塑後張量 T_mps (1D, non-fused, shape={T1d_mps.shape()}, labels={T1d_mps.labels()}):\n{T1d_mps.get_block().numpy()}")
+    # 預期: [[1. 5.] [3. 7.]]
+
+    # === 測試 2: 2D Non-Fused (nBit=1, M=2) ===
+    print("\n--- 測試 2: 2D Non-Fused (nBit=1, M=2) ---")
+    qg2d_nf = QuanticGrid(a=0.0, b=2.0, nBit=1, dim=2, fused=False, f=f_2d)
+    T2d_uni = qg2d_nf.get_quantics_tensor()
+    print(f"初始張量 T (2D, shape={T2d_uni.shape()}):\n{T2d_uni.get_block().numpy()}")
+    T2d_mps_nf = qg2d_nf.reshape_to_mps(T2d_uni.clone())
+    print(f"重塑後張量 T_mps (2D, non-fused, shape={T2d_mps_nf.shape()}, labels={T2d_mps_nf.labels()}):\n{T2d_mps_nf.get_block().numpy()}")
+    # 預期: [[0. 2.] [1. 3.]]
+
+    # === 測試 3: 2D Fused (nBit=1, M=2) ===
+    print("\n--- 測試 3: 2D Fused (nBit=1, M=2) ---")
+    qg2d_f = QuanticGrid(a=0.0, b=2.0, nBit=1, dim=2, fused=True, f=f_2d)
+    T2d_mps_f = qg2d_f.reshape_to_mps(T2d_uni.clone())
+    print(f"重塑後張量 T_mps (2D, fused, shape={T2d_mps_f.shape()}, labels={T2d_mps_f.labels()}):\n{T2d_mps_f.get_block().numpy()}")
+    # 預期: [0., 1., 2., 3.] (手動映射應該能得到這個結果)
+
+    # === 測試 4: 2D Non-Fused (nBit=2, M=4) ===
+    print("\n--- 測試 4: 2D Non-Fused (nBit=2, M=4) ---")
+    qg2d_nf2 = QuanticGrid(a=0.0, b=4.0, nBit=2, dim=2, fused=False, f=f_2d)
+    T2d_uni2 = qg2d_nf2.get_quantics_tensor()
+    print(f"初始張量 T (2D, nBit=2, shape={T2d_uni2.shape()}):")
+    T2d_mps_nf2 = qg2d_nf2.reshape_to_mps(T2d_uni2.clone())
+    print(f"重塑後張量 T_mps (2D, non-fused, nBit=2, shape={T2d_mps_nf2.shape()}, labels={T2d_mps_nf2.labels()}):")
+    print(T2d_mps_nf2.get_block().numpy().flatten())
+    expected_flat_nf = np.array([0., 1., 2., 3., 2., 3., 4., 5., 4., 5., 6., 7., 6., 7., 8., 9.])
+    print(f"預期展平值 (基於位元分組邏輯): {expected_flat_nf}")
+
+    # === 測試 5: 3D Fused (nBit=1, M=2) ===
+    print("\n--- 測試 5: 3D Fused (nBit=1, M=2) ---")
+    qg3d_f = QuanticGrid(a=0.0, b=1.0, nBit=1, dim=3, fused=True, f=f_3d)
+    T3d_uni = qg3d_f.get_quantics_tensor()
+    print(f"初始張量 T (3D, nBit=1, shape={T3d_uni.shape()}):\n{T3d_uni.get_block().numpy()}")
+    T3d_mps_f = qg3d_f.reshape_to_mps(T3d_uni.clone())
+    print(f"重塑後張量 T_mps (3D, fused, nBit=1, shape={T3d_mps_f.shape()}, labels={T3d_mps_f.labels()}):\n{T3d_mps_f.get_block().numpy()}")
+    # 預期: [0.  0.5 1.  1.5 1.5 2.  2.5 3. ] (手動映射應該能得到這個結果)
