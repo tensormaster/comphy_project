@@ -1,4 +1,4 @@
-# filename: tensortrain.py (Corrected and with TODOs Implemented)
+# filename: tensortrain.py 
 
 import cytnx
 import numpy as np
