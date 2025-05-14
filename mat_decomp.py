@@ -144,9 +144,10 @@ class MatprrLUFixedTol:
         ut_L, ut_D, ut_U = rr.PrrLU()
 
         # store conversions to ndarray ---------------------------------
-        self.L_ = _tensor_to_numpy(ut_L)
-        self.D_ = _tensor_to_numpy(ut_D)
-        self.U_ = _tensor_to_numpy(ut_U)
+        self.L_ = ut_L.get_block()
+        self.D_ = ut_D.get_block()
+        self.U_ = ut_U.get_block()
+        
 
         # post‑info -----------------------------------------------------
         self.rank = rr.get_rank_info()[-1] if rr.get_rank_info() else 0
