@@ -770,131 +770,143 @@ class TensorTrain:
 # Inside the TensorTrain class definition:
 
     def __add__(self, other: 'TensorTrain') -> 'TensorTrain':
-        if not self.M:
-            # Create a new TensorTrain from other.M to avoid returning a reference
-            # that might be mutated if 'other' is later changed.
-            # __init__ handles creation of UniTensors with proper conventions.
-            return TensorTrain(other.M.copy() if other.M else None) 
-        if not other.M:
-            return TensorTrain(self.M.copy() if self.M else None)
+        if not self.M: # If self is empty
+            # Return a new TensorTrain instance from a copy of other.M's cores
+            # Ensure to use .clone() for each UniTensor if other.M is a list of UniTensors
+            # and __init__ expects a list.
+            cloned_other_cores = []
+            if other.M:
+                for core in other.M:
+                    if isinstance(core, UniTensor):
+                        cloned_other_cores.append(core.clone())
+                    else: # Should not happen if other is a valid TensorTrain post-refactor
+                        cloned_other_cores.append(core) # Or handle error
+            return TensorTrain(cloned_other_cores if cloned_other_cores else None)
+
+        if not other.M: # If other is empty
+            cloned_self_cores = []
+            if self.M:
+                for core in self.M:
+                    if isinstance(core, UniTensor):
+                        cloned_self_cores.append(core.clone())
+                    else:
+                        cloned_self_cores.append(core)
+            return TensorTrain(cloned_self_cores if cloned_self_cores else None)
 
         if len(self.M) != len(other.M):
             raise ValueError("Cannot add tensor trains of different lengths.")
 
         num_cores = len(self.M)
 
-        # Determine composite device and dtype for the new cores
-        # Scan all cores from both tensor trains
-        all_cores_for_scan = self.M + other.M
-        
-        comp_device = all_cores_for_scan[0].device() # Base device
-        
-        final_requires_complex = False
-        final_requires_double_precision = False
-        for core_scan in all_cores_for_scan:
-            if core_scan.dtype():
-                final_requires_complex = True
-            dt_int = core_scan.dtype()
-            if dt_int == Type.Double or dt_int == Type.ComplexDouble:
-                final_requires_double_precision = True
-            if final_requires_complex and final_requires_double_precision:
-                break # Max requirement found
+        # Determine composite device and dtype (same logic as your working version)
+        comp_device = self.M[0].device() 
+        final_requires_complex, final_requires_double_precision = False, False
+        for k_check in range(num_cores): 
+            for core_scan in [self.M[k_check], other.M[k_check]]:
+                dt_cs = core_scan.dtype()
+                if dt_cs == Type.ComplexFloat or dt_cs == Type.ComplexDouble:
+                    final_requires_complex = True
+                if dt_cs == Type.Double or dt_cs == Type.ComplexDouble:
+                    final_requires_double_precision = True
+                if final_requires_complex and final_requires_double_precision: break
+            if final_requires_complex and final_requires_double_precision: break
         
         if final_requires_complex:
             comp_dtype = Type.ComplexDouble if final_requires_double_precision else Type.ComplexFloat
-        else: # All real
+        else:
             comp_dtype = Type.Double if final_requires_double_precision else Type.Float
+        
+        type_id_to_name = { # For debug printing
+            Type.Void: "Void", Type.ComplexDouble: "ComplexDouble", 
+            Type.ComplexFloat: "ComplexFloat", Type.Double: "Double", 
+            Type.Float: "Float", Type.Uint64: "Uint64", Type.Int64: "Int64",
+            Type.Uint32: "Uint32", Type.Int32: "Int32", Type.Uint16: "Uint16", 
+            Type.Int16: "Int16", Type.Bool: "Bool"
+        }
+        comp_dtype_name_str = type_id_to_name.get(comp_dtype, f"UnknownTypeID({comp_dtype})")
+        logger.debug(f"__add__ Op: Target comp_dtype for new cores: {comp_dtype} ({comp_dtype_name_str}), Target comp_device: {comp_device}")
 
         new_UniTensor_cores: List[UniTensor] = []
         for k in range(num_cores):
-            A_ut = self.M[k]
-            B_ut = other.M[k]
+            # --- Process self.M[k] ---
+            # Create a new variable for the processed UniTensor from self.M[k]
+            A_ut_processed = self.M[k].astype(comp_dtype).to(comp_device)
+            A_ut_processed.contiguous_() # In-place operation, modifies A_ut_processed
 
-            # Ensure cores are on the target device and dtype for block operations
-            A_conv = A_ut.astype(comp_dtype).to(comp_device).contiguous_()
-            B_conv = B_ut.astype(comp_dtype).to(comp_device).contiguous_()
+            # --- Process other.M[k] ---
+            # Create a new variable for the processed UniTensor from other.M[k]
+            B_ut_processed = other.M[k].astype(comp_dtype).to(comp_device)
+            B_ut_processed.contiguous_() # In-place operation, modifies B_ut_processed
             
-            # Get bonds and labels from A_conv (self.M[k]) to define new core structure
-            # (assuming B_conv has compatible physical dim and same label convention)
-            LA_b, PA_b, RA_b = A_conv.bonds()
-            LA_l, PA_l, RA_l = A_conv.labels() # These will be labels for the new core
+            # Original labels are fetched from self.M[k] for the new core definition.
+            LA_l_orig, PA_l_orig, RA_l_orig = self.M[k].labels() 
 
-            LB_b, PB_b, RB_b = B_conv.bonds()
+            # Use the processed UniTensors (which are not None) for subsequent operations
+            if A_ut_processed is None: # Should not happen if previous steps are correct
+                raise ValueError(f"__add__: A_ut_processed became None at core {k} for self.M.")
+            if B_ut_processed is None:
+                raise ValueError(f"__add__: B_ut_processed became None at core {k} for other.M.")
 
-            if PA_b.dim() != PB_b.dim():
-                raise ValueError(f"Physical dimension mismatch at core {k}: "
-                                 f"{PA_b.dim()} (self) vs {PB_b.dim()} (other)")
-            if PA_l != B_conv.labels()[1]: # Check physical label consistency
-                 logger.warning(f"Physical labels at core {k} differ but dims match: "
-                                f"'{PA_l}' (self) vs '{B_conv.labels()[1]}' (other). Using '{PA_l}'.")
+            rA, dA, sA = A_ut_processed.shape() # Dims of processed A
+            rB, dB, sB = B_ut_processed.shape() # Dims of processed B
 
-
-            r1, d1, s1 = LA_b.dim(), PA_b.dim(), RA_b.dim()
-            r2, _, s2 = LB_b.dim(), PB_b.dim(), RB_b.dim() # d1 should be PB_b.dim()
-
-            # Create new bonds for the combined core
-            bd_L_new = cytnx.Bond(r1 + r2, BD_IN)
-            bd_P_new = PA_b.clone() # Physical bond properties from A_conv
-            bd_R_new = cytnx.Bond(s1 + s2, BD_OUT)
+            if dA != dB: # Physical dimensions must match
+                raise ValueError(f"Physical dimension mismatch at core {k}: {dA} (self) vs {dB} (other)")
             
-            new_labels = [LA_l, PA_l, RA_l] # Use labels from self.M[k]
+            # Physical label consistency check (optional, good for warning)
+            # if PA_l_orig != other.M[k].labels()[1]: 
+            #      logger.warning(f"Physical labels at core {k} differ: '{PA_l_orig}' vs '{other.M[k].labels()[1]}'. Using '{PA_l_orig}'.")
 
-            # Create the data Tensor for the new UniTensor core
-            new_data_tensor = cytnx.zeros([r1 + r2, d1, s1 + s2], 
-                                          dtype=comp_dtype, device=comp_device)
+            new_r_left: int
+            new_d_phys: int = dA 
+            new_s_right: int
             
-            A_block = A_conv.get_block_() # This is a cytnx.Tensor
-            B_block = B_conv.get_block_() # This is a cytnx.Tensor
+            # Get blocks from the processed, contiguous UniTensors
+            A_block = A_ut_processed.get_block_()
+            B_block = B_ut_processed.get_block_()
 
-            # Populate the new data tensor using direct slice assignment
-            # This assumes cytnx.Tensor supports this kind of assignment.
-            # new_data_tensor[Slice_r1, Slice_p, Slice_s1] = A_block[Slice_r1_orig, Slice_p_orig, Slice_s1_orig]
-            for p_idx in range(d1):
-                # Extract 2D slices (Matrices for fixed physical index p_idx)
-                # A_block_p is r1 x s1
-                # B_block_p is r2 x s2
-                # These getSlice operations return a view or copy, which is a Tensor.
-                A_block_p = A_block.getSlice([None, p_idx, None]) 
-                B_block_p = B_block.getSlice([None, p_idx, None])
+            # --- Determine dimensions and fill new_data_tensor (C++ kron_add logic) ---
+            # This logic remains the same as my previous C++ mimicking version
+            if k == 0: # First core
+                if rA != 1: logger.warning(f"__add__ k=0: Left bond of A ({rA}) is not 1 after processing.")
+                if rB != rA : # Check based on processed rA and rB
+                     logger.warning(f"__add__ k=0: rB ({rB}) != rA ({rA}) for B placement. This might lead to unexpected block summation if C++ logic expects exact dimension match for sub-cube assignment.")
+                new_r_left = rA 
+                new_s_right = sA + sB
+                new_data_tensor = cytnx.zeros([new_r_left, new_d_phys, new_s_right], dtype=comp_dtype, device=comp_device)
+                new_data_tensor[0:rA, :, 0:sA] = A_block
+                new_data_tensor[0:min(rA,rB), :, sA : sA+sB] = B_block[0:min(rA,rB), :, :] # Adjusted slicing for safety
 
-                # Assign A_block_p to the top-left block of the p_idx-th slice of new_data_tensor
-                # new_data_tensor[:r1, p_idx, :s1] = A_block_p # This attempts to assign r1xs1 to r1x1xs1
-                # Correct way to assign a 2D slice to a 3D tensor's slice view:
-                target_slice_A = new_data_tensor.getSlice([slice(0,r1), p_idx, slice(0,s1)])
-                target_slice_A.copy_(A_block_p.reshape(r1,1,s1)) # Reshape A_block_p to match target view for copy_
-                                                                 # Or, if A_block_p is (r1,s1) and target_slice_A view is (r1,1,s1)
-                                                                 # we need careful assignment.
-                # Cytnx assignment for slices like this:
-                # Loop through elements or use a more direct block copy if shapes are set up for it.
-
-                # A simpler, more direct way if cytnx.Tensor supports block assignment:
-                # This needs verification for cytnx.Tensor behavior.
-                # For each physical index p_idx:
-                current_phys_slice_A = A_block[:, p_idx, :] # Shape (r1, s1)
-                current_phys_slice_B = B_block[:, p_idx, :] # Shape (r2, s2)
-
-                # Assign to the larger slice of new_data_tensor
-                # new_data_tensor[:r1, p_idx, :s1]
-                # new_data_tensor[r1:r1+r2, p_idx, s1:s1+s2]
-                
-                # To ensure this works robustly, let's iterate over rows for assignment
-                # This is less efficient but clear.
-                # For the p_idx-th physical slice of new_data_tensor:
-                for r_idx_a in range(r1):
-                    new_data_tensor[r_idx_a, p_idx, :s1] = A_block[r_idx_a, p_idx, :]
-                
-                for r_idx_b in range(r2):
-                    new_data_tensor[r1 + r_idx_b, p_idx, s1 : s1+s2] = B_block[r_idx_b, p_idx, :]
+            elif k == num_cores - 1: # Last core
+                if sB != 1: logger.warning(f"__add__ k={k}: Right bond of B ({sB}) is not 1 after processing.")
+                if sA != sB :
+                    logger.warning(f"__add__ k={k}: sA ({sA}) != sB ({sB}). C++ logic implies sA should match sB for A's placement. Adapting.")
+                new_r_left = rA + rB
+                new_s_right = sB 
+                new_data_tensor = cytnx.zeros([new_r_left, new_d_phys, new_s_right], dtype=comp_dtype, device=comp_device)
+                new_data_tensor[0:rA, :, 0:min(sA,sB)] = A_block[:, :, 0:min(sA,sB)] # Adjusted slicing
+                new_data_tensor[rA : rA+rB, :, 0:sB] = B_block
+            
+            else: # Middle cores
+                new_r_left = rA + rB
+                new_s_right = sA + sB
+                new_data_tensor = cytnx.zeros([new_r_left, new_d_phys, new_s_right], dtype=comp_dtype, device=comp_device)
+                new_data_tensor[0:rA, :, 0:sA] = A_block
+                new_data_tensor[rA : rA+rB, :, sA : sA+sB] = B_block
+            
+            # Create new bonds and labels for the UniTensor
+            bd_L_new = cytnx.Bond(new_r_left, BD_IN)
+            bd_P_new = A_ut_processed.bonds()[1].clone() # Physical bond from processed A_ut
+            bd_R_new = cytnx.Bond(new_s_right, BD_OUT)
+            # Use original labels from self.M[k] for the new core's structure
+            new_core_labels = [LA_l_orig, PA_l_orig, RA_l_orig]
 
             new_core_ut = UniTensor(bonds=[bd_L_new, bd_P_new, bd_R_new], 
-                                    labels=new_labels, 
+                                    labels=new_core_labels, 
                                     rowrank=1)
             new_core_ut.put_block(new_data_tensor)
-            
-            # Optional: Validate the newly created core
-            # TensorTrain._assert_core_validity(new_core_ut, k, num_cores)
-
             new_UniTensor_cores.append(new_core_ut)
+        
         result_tt = TensorTrain(new_UniTensor_cores)
         return result_tt
 
@@ -1419,24 +1431,65 @@ if __name__ == "__main__":
     # --- Test __add__ ---
     print("\n--- Testing Add ---")
     try:
-        tt_c = original_tt + tt_b_for_overlap # tt_b_for_overlap is identical to original_tt
+        tt_c = original_tt + tt_b_for_overlap 
         print(f"tt_c (original_tt + tt_b_for_overlap) has {len(tt_c.M)} cores.")
-        if tt_c.M:
-            # TensorTrain._assert_core_validity(tt_c.M[0], 0, L) # Assuming L is num_cores for tt_c
-            print(f"First core of tt_c: Labels={tt_c.M[0].labels()}, Shape={tt_c.M[0].shape()}")
-            # Expected shape for first core of tt_c: (1+1, phys_dims[0], 1+1) = (2, phys_dims[0], 2)
-            expected_L_dim_add = original_tt.M[0].bonds()[0].dim() + tt_b_for_overlap.M[0].bonds()[0].dim()
-            expected_R_dim_add = original_tt.M[0].bonds()[2].dim() + tt_b_for_overlap.M[0].bonds()[2].dim()
-            assert tt_c.M[0].bonds()[0].dim() == expected_L_dim_add, "Sum TT: Left bond dim mismatch"
-            assert tt_c.M[0].bonds()[2].dim() == expected_R_dim_add, "Sum TT: Right bond dim mismatch"
-            assert tt_c.M[0].bonds()[1].dim() == original_tt.M[0].bonds()[1].dim(), "Sum TT: Phys bond dim mismatch"
-            print("Addition core shapes seem correct.")
+        if tt_c.M and L > 0: # Ensure L > 0 for M[0] and M[L-1] access
+            # --- For the first core (k=0) of tt_c ---
+            first_core_c = tt_c.M[0]
+            print(f"First core of tt_c: Labels={first_core_c.labels()}, Shape={first_core_c.shape()}")
             
+            # Expected dimensions for the FIRST core based on C++ like __add__
+            expected_L_dim_first_core = original_tt.M[0].bonds()[0].dim() # Should be rA (1)
+            expected_P_dim_first_core = original_tt.M[0].bonds()[1].dim() # Should be dA
+            expected_R_dim_first_core = original_tt.M[0].bonds()[2].dim() + tt_b_for_overlap.M[0].bonds()[2].dim() # sA + sB
+
+            assert first_core_c.bonds()[0].dim() == expected_L_dim_first_core, \
+                f"Sum TT First Core: Left bond dim mismatch. Expected {expected_L_dim_first_core}, Got {first_core_c.bonds()[0].dim()}"
+            assert first_core_c.bonds()[1].dim() == expected_P_dim_first_core, \
+                f"Sum TT First Core: Phys bond dim mismatch. Expected {expected_P_dim_first_core}, Got {first_core_c.bonds()[1].dim()}"
+            assert first_core_c.bonds()[2].dim() == expected_R_dim_first_core, \
+                f"Sum TT First Core: Right bond dim mismatch. Expected {expected_R_dim_first_core}, Got {first_core_c.bonds()[2].dim()}"
+
+            # --- For the last core (k=L-1) of tt_c (if L > 1) ---
+            if L > 1:
+                last_core_c = tt_c.M[L-1]
+                print(f"Last core of tt_c: Labels={last_core_c.labels()}, Shape={last_core_c.shape()}")
+
+                expected_L_dim_last_core = original_tt.M[L-1].bonds()[0].dim() + tt_b_for_overlap.M[L-1].bonds()[0].dim() # rA + rB
+                expected_P_dim_last_core = original_tt.M[L-1].bonds()[1].dim() # dA
+                expected_R_dim_last_core = tt_b_for_overlap.M[L-1].bonds()[2].dim() # Should be sB (from other, which is 1)
+                                            # Or original_tt.M[L-1].bonds()[2].dim() if C++ was sA
+
+                assert last_core_c.bonds()[0].dim() == expected_L_dim_last_core, \
+                    f"Sum TT Last Core: Left bond dim mismatch. Expected {expected_L_dim_last_core}, Got {last_core_c.bonds()[0].dim()}"
+                assert last_core_c.bonds()[1].dim() == expected_P_dim_last_core, \
+                    f"Sum TT Last Core: Phys bond dim mismatch. Expected {expected_P_dim_last_core}, Got {last_core_c.bonds()[1].dim()}"
+                assert last_core_c.bonds()[2].dim() == expected_R_dim_last_core, \
+                    f"Sum TT Last Core: Right bond dim mismatch. Expected {expected_R_dim_last_core}, Got {last_core_c.bonds()[2].dim()}"
+
+            # --- For middle cores of tt_c (if L > 2) ---
+            if L > 2:
+                middle_core_c = tt_c.M[1] # Example for k=1
+                print(f"Middle core (k=1) of tt_c: Labels={middle_core_c.labels()}, Shape={middle_core_c.shape()}")
+                expected_L_dim_middle = original_tt.M[1].bonds()[0].dim() + tt_b_for_overlap.M[1].bonds()[0].dim()
+                expected_P_dim_middle = original_tt.M[1].bonds()[1].dim()
+                expected_R_dim_middle = original_tt.M[1].bonds()[2].dim() + tt_b_for_overlap.M[1].bonds()[2].dim()
+                assert middle_core_c.bonds()[0].dim() == expected_L_dim_middle
+                assert middle_core_c.bonds()[1].dim() == expected_P_dim_middle
+                assert middle_core_c.bonds()[2].dim() == expected_R_dim_middle
+
+
+            print("Addition core shapes structurally verified against C++-like logic.")
+            
+            # Now, the eval test can proceed because tt_c's outer bonds are dimension 1
             val_c_eval = tt_c.eval(idx_to_eval)
             print(f"tt_c.eval({idx_to_eval}) = {val_c_eval}")
             # val_eval was from original_tt.eval(idx_to_eval)
             assert _np.isclose(val_c_eval, 2 * val_eval), f"tt_c.eval ({val_c_eval}) should be 2 * original_tt.eval ({val_eval})"
             print("__add__ test PASSED.")
+        else:
+            print("__add__ test: tt_c has no cores (unexpected if inputs were not empty).")
+
     except Exception as e:
         print(f"ERROR in __add__ test: {e}")
         logger.exception("__add__ test exception details:")
