@@ -1,8 +1,8 @@
 import cytnx
-from cytnx import UniTensor, Tensor, Type, Device, BD_IN, BD_OUT,Bond
+from cytnx import UniTensor, Type, Device, BD_IN, BD_OUT,Bond
 import numpy as np
 import logging
-from typing import Dict, Optional, List, Union
+from typing import Dict, Optional, List
 from tensor_train import TensorTrain # Assume TensorTrain class is defined in tensor_train.py
 
 
@@ -116,12 +116,7 @@ class ProdOp:
                                 device=target_device)
             ut_core.put_block(core_data_tensor.contiguous_()) 
 
-            # Corrected logging using instance methods for dtype/device strings
-            logger.debug(f"ProdOp.to_tensorTrain: site {i} "
-                         f"op_matrix_dd shape=({d_phys},{d_phys}), dtype={op_matrix_dd.dtype_str()}, device={op_matrix_dd.device_str()} " # Use instance methods
-                         f"-> data_for_core shape=({data_for_core.shape()}) "
-                         f"-> UTcore shape={ut_core.shape()}, labels={ut_core.labels()}, "
-                         f"dtype={ut_core.dtype_str()}, device={ut_core.device_str()}") # Use instance methods
+
             ut_cores.append(ut_core)
             
         return TensorTrain(ut_cores)
@@ -228,92 +223,212 @@ class ProdOp:
         
         return final_result
 
+
     def overlap_mps(self, psi: TensorTrain) -> float:
-        # ... (initial checks and effective_dtype/device logic remain the same) ...
-        # Current placeholder implementation from auto_mpo.py
-        # This will be replaced by the more rigorous UniTensor contraction logic.
         if not isinstance(psi, TensorTrain):
             raise TypeError("Input 'psi' for ProdOp.overlap_mps must be a TensorTrain instance.")
-        if not self.ops:
-            return 0.0 
-        L_psi = len(psi.M)
-        if L_psi == 0:
-            if self.ops: 
-                raise ValueError("Cannot compute expectation value with non-empty ProdOp on an empty MPS psi.")
-            else: 
+        
+        # Handle empty psi
+        if not psi.M: 
+            if not self.ops: # Both ProdOp and psi are empty
+                logger.info("ProdOp.overlap_mps: Both ProdOp and psi are empty. Returning 0.0")
                 return 0.0
+            else: # Non-empty ProdOp on empty MPS
+                raise ValueError("Cannot compute expectation value with non-empty ProdOp on an empty MPS psi.")
+
+        L_psi = len(psi.M)
+        # If self.ops is empty here, it implies ProdOp is the Identity operator.
+        # The loop with self.ops.get(k, ProdOp.one) will correctly use ProdOp.one.
         
         max_op_site = max(self.ops.keys(), default=-1)
-        if max_op_site >= L_psi: 
+        # max_op_site can be -1 if self.ops is empty. L_psi > 0 is always true if psi.M is not empty.
+        if max_op_site >= L_psi : # This condition is fine even if max_op_site is -1.
             raise ValueError(
-                f"Operator site index {max_op_site} is out of bounds "
-                f"for MPS of length {L_psi}."
+                f"Operator site index {max_op_site} is out of bounds for MPS of length {L_psi}."
             )
         
         if not hasattr(ProdOp, 'one') or ProdOp.one is None:
             raise RuntimeError("ProdOp.one is not set. Call ProdOp.set_identity(d) first.")
-        d_op_phys = ProdOp.one.shape()[0]
+        
+        d_phys = ProdOp.one.shape()[0]
 
-        effective_dtype = ProdOp.one.dtype() 
+        # --- Determine effective_dtype and effective_device ---
+        op_dtypes = [op.dtype() for op in self.ops.values()]
+        psi_core_dtypes = [core.dtype() for core in psi.M if core is not None] # psi.M checked not empty
+        all_involved_dtypes = [ProdOp.one.dtype()] + op_dtypes + psi_core_dtypes
+        is_complex = any(dt in [Type.ComplexDouble, Type.ComplexFloat] for dt in all_involved_dtypes)
+        is_double = any(dt in [Type.Double, Type.ComplexDouble] for dt in all_involved_dtypes)
+        
+        effective_dtype = Type.Void 
+        if is_complex:
+            effective_dtype = Type.ComplexDouble if is_double else Type.ComplexFloat
+        else:
+            effective_dtype = Type.Double if is_double else Type.Float
+        
         effective_device = ProdOp.one.device()
-        is_complex_calc = (effective_dtype == cytnx.Type.ComplexDouble or 
-                           effective_dtype == cytnx.Type.ComplexFloat)
         
-        if not is_complex_calc:
-            for op_tensor in self.ops.values():
-                op_dt = op_tensor.dtype()
-                if op_dt == cytnx.Type.ComplexDouble or op_dt == cytnx.Type.ComplexFloat:
-                    is_complex_calc = True
-                    if effective_dtype == cytnx.Type.Float: effective_dtype = cytnx.Type.ComplexFloat
-                    elif effective_dtype == cytnx.Type.Double: effective_dtype = cytnx.Type.ComplexDouble
-                    if op_dt == cytnx.Type.ComplexDouble and effective_dtype == cytnx.Type.ComplexFloat:
-                        effective_dtype = cytnx.Type.ComplexDouble
-                    break 
-        if not is_complex_calc: 
-            for core_psi in psi.M:
-                psi_dt = core_psi.dtype()
-                if psi_dt == cytnx.Type.ComplexDouble or psi_dt == cytnx.Type.ComplexFloat:
-                    is_complex_calc = True
-                    if effective_dtype == cytnx.Type.Float: effective_dtype = cytnx.Type.ComplexFloat
-                    elif effective_dtype == cytnx.Type.Double: effective_dtype = cytnx.Type.ComplexDouble
-                    if psi_dt == cytnx.Type.ComplexDouble and effective_dtype == cytnx.Type.ComplexFloat:
-                        effective_dtype = cytnx.Type.ComplexDouble
-                    break
-        
-        C_env = cytnx.zeros([1,1], dtype=effective_dtype, device=effective_device)
-        C_env[0,0] = 1.0 
+        _dummyt = cytnx.zeros(1,dtype=effective_dtype,device=effective_device) # For logging
+        logger.debug(f"Overlap_mps: EffectiveDtype={_dummyt.dtype_str()}, Device={_dummyt.device_str()}")
 
+        # --- Initialize Environment Tensor L_env ---
+        env_LpsiC_lbl, env_Lop_lbl, env_LpsiK_lbl = "envLpsiC", "envLop", "envLpsiK"
+        L_env = UniTensor(
+            bonds=[Bond(1, BD_OUT), Bond(1, BD_OUT), Bond(1, BD_OUT)],
+            labels=[env_LpsiC_lbl, env_Lop_lbl, env_LpsiK_lbl],
+            rowrank=1, dtype=effective_dtype, device=effective_device
+        )
+        L_env.get_block_()[0,0,0] = 1.0
+
+        # --- Iteration over MPS sites ---
         for k in range(L_psi):
-            psi_k_core = psi.M[k] 
-            if psi_k_core.rank() != 3:
-                raise ValueError(f"MPS core at site {k} must be rank 3, got {psi_k_core.rank()}")
-            psi_k_left_dim, psi_k_phys_dim, psi_k_right_dim = psi_k_core.shape()
-            if psi_k_phys_dim != d_op_phys:
-                raise ValueError(f"Physical dimension mismatch at site {k}: Op({d_op_phys}) vs Psi({psi_k_phys_dim})")
+            psi_k = psi.M[k].astype(effective_dtype).to(effective_device)
+            psi_k_conj = psi_k.Conj()
+            op_k_dd = self.ops.get(k, ProdOp.one).astype(effective_dtype).to(effective_device)
 
-            op_k_dd_for_sum = self.ops.get(k, ProdOp.one).astype(effective_dtype).to(effective_device)
+            op_vL_lbl, op_pIn_lbl, op_pOut_lbl, op_vR_lbl = f"opvL{k}",f"opPIn{k}",f"opPOut{k}",f"opvR{k}"
+            Op_k = UniTensor(
+                bonds=[Bond(1,BD_IN), Bond(d_phys,BD_OUT), Bond(d_phys,BD_IN), Bond(1,BD_OUT)],
+                labels=[op_vL_lbl, op_pIn_lbl, op_pOut_lbl, op_vR_lbl], 
+                rowrank=2, dtype=effective_dtype, device=effective_device
+            )
+            Op_k.put_block(op_k_dd.reshape(1,d_phys,d_phys,1).contiguous_())
+
+            psi_k_L_orig_lbl, psi_k_P_orig_lbl, psi_k_R_orig_lbl = psi_k.labels()
+            psi_k_conj_L_orig_lbl, psi_k_conj_P_orig_lbl, psi_k_conj_R_orig_lbl = psi_k_conj.labels()
             
-            current_op_sum_np = op_k_dd_for_sum.numpy().sum()
-            current_op_sum_item: Union[float, complex]
-            if isinstance(current_op_sum_np, complex):
-                 current_op_sum_item = complex(current_op_sum_np)
+            L_env_ctr = L_env.clone()
+            psi_k_conj_ctr = psi_k_conj.clone() 
+            Op_k_ctr = Op_k.clone()
+            
+            # --- Contract T1 ---
+            ct_lbl_L_psiC = f"__ct_LpsiC_{k}__" 
+            L_env_ctr.relabel_(env_LpsiC_lbl, ct_lbl_L_psiC)
+            
+            idx_redirect_psi_conj_L = psi_k_conj_ctr.labels().index(psi_k_conj_L_orig_lbl)
+            bond_to_check_psi_conj_L = psi_k_conj_ctr.bonds()[idx_redirect_psi_conj_L]
+            original_type_name_T1 = bond_to_check_psi_conj_L.type().name
+            if bond_to_check_psi_conj_L.type() != BD_IN: 
+                 bond_to_check_psi_conj_L.redirect_()
+                 logger.debug(f"Site {k} T1-redirect: psi_k_conj_ctr leg '{psi_k_conj_L_orig_lbl}' was {original_type_name_T1}, redirected to {bond_to_check_psi_conj_L.type().name}")
             else:
-                 current_op_sum_item = float(current_op_sum_np)
+                 logger.debug(f"Site {k} T1-redirect: psi_k_conj_ctr leg '{psi_k_conj_L_orig_lbl}' is already {original_type_name_T1} (BD_IN/KET).")
+            psi_k_conj_ctr.relabel_(psi_k_conj_L_orig_lbl, ct_lbl_L_psiC)
+            T1 = cytnx.Contract(L_env_ctr, psi_k_conj_ctr)
 
-            C_env[0,0] = C_env[0,0].item() * current_op_sum_item
+            # --- Contract T2 ---
+            ct_lbl_Lop_opvL = f"__ct_Lop_opvL_{k}__"
+            ct_lbl_psiCP_opPIn = f"__ct_psiCP_opPIn_{k}__"
+            T1_ctr = T1.clone()
+            T1_ctr.relabel_(env_Lop_lbl, ct_lbl_Lop_opvL)
+            T1_ctr.relabel_(psi_k_conj_P_orig_lbl, ct_lbl_psiCP_opPIn)
             
-        final_scalar_val = C_env.item()
-        # Corrected logging using instance method .dtype_str()
-        logger.debug(f"ProdOp.overlap_mps (placeholder logic): L_psi={L_psi}, final C.item()={final_scalar_val}, C.dtype={C_env.dtype_str()}")
+            Op_k_for_T2 = Op_k_ctr.clone() 
+            Op_k_for_T2.relabel_(op_vL_lbl, ct_lbl_Lop_opvL)
+            Op_k_for_T2.relabel_(op_pIn_lbl, ct_lbl_psiCP_opPIn)
+            
+            idx_T1_psiCP_leg = T1_ctr.labels().index(ct_lbl_psiCP_opPIn)
+            bond_T1_psiCP_leg = T1_ctr.bonds()[idx_T1_psiCP_leg]
+            original_type_name_T2 = bond_T1_psiCP_leg.type().name
+            if bond_T1_psiCP_leg.type() != BD_IN:
+                 bond_T1_psiCP_leg.redirect_()
+                 logger.debug(f"Site {k} T2-redirect: T1_ctr leg '{ct_lbl_psiCP_opPIn}' was {original_type_name_T2}, redirected to {bond_T1_psiCP_leg.type().name}")
+            else:
+                 logger.debug(f"Site {k} T2-redirect: T1_ctr leg '{ct_lbl_psiCP_opPIn}' is already {original_type_name_T2} (BD_IN/KET).")
+            T2 = cytnx.Contract(T1_ctr, Op_k_for_T2)
+            
+            # --- Contract L_env_updated (final for site k) ---
+            T2_for_final = T2.clone()
+            psi_k_for_final = psi_k.clone() # Use original psi_k (already cloned as psi_k_ctr, but use fresh name)
 
-        if isinstance(final_scalar_val, complex):
-            if abs(final_scalar_val.imag) > 1e-12:
-                logger.warning(
-                    f"ProdOp.overlap_mps result has a significant imaginary part: {final_scalar_val}. "
-                    "Returning real part based on current interface."
+            # Define unique names for the "dangling" legs that will form the next L_env
+            unique_dangling_T2_psiCR = psi_k_conj_R_orig_lbl + f"_d1_{k}"
+            if psi_k_conj_R_orig_lbl in T2_for_final.labels():
+                T2_for_final.relabel_(psi_k_conj_R_orig_lbl, unique_dangling_T2_psiCR)
+            
+            unique_dangling_T2_opR = op_vR_lbl + f"_d2_{k}"
+            if op_vR_lbl in T2_for_final.labels():
+                T2_for_final.relabel_(op_vR_lbl, unique_dangling_T2_opR)
+
+            unique_dangling_psiK_R = psi_k_R_orig_lbl + f"_d3_{k}"
+            if psi_k_R_orig_lbl in psi_k_for_final.labels():
+                psi_k_for_final.relabel_(psi_k_R_orig_lbl, unique_dangling_psiK_R)
+            
+            ct_lbl_LpsiK_psiKL = f"__ct_LpsiK_psiKL_{k}__"
+            ct_lbl_opPOut_psiKP = f"__ct_opPOut_psiKP_{k}__"
+
+            T2_for_final.relabel_(env_LpsiK_lbl, ct_lbl_LpsiK_psiKL)
+            T2_for_final.relabel_(op_pOut_lbl, ct_lbl_opPOut_psiKP)   
+            psi_k_for_final.relabel_(psi_k_L_orig_lbl, ct_lbl_LpsiK_psiKL)
+            psi_k_for_final.relabel_(psi_k_P_orig_lbl, ct_lbl_opPOut_psiKP)
+            
+            logger.debug(f"Site {k} Pre-FinalContract: T2_for_final labels: {T2_for_final.labels()}")
+            logger.debug(f"  Bond types for T2_for_final['{ct_lbl_LpsiK_psiKL}']: {T2_for_final.bond(ct_lbl_LpsiK_psiKL).type().name}")
+            logger.debug(f"  Bond types for T2_for_final['{ct_lbl_opPOut_psiKP}']: {T2_for_final.bond(ct_lbl_opPOut_psiKP).type().name}")
+            logger.debug(f"Site {k} Pre-FinalContract: psi_k_for_final labels: {psi_k_for_final.labels()}")
+            logger.debug(f"  Bond types for psi_k_for_final['{ct_lbl_LpsiK_psiKL}']: {psi_k_for_final.bond(ct_lbl_LpsiK_psiKL).type().name}")
+            logger.debug(f"  Bond types for psi_k_for_final['{ct_lbl_opPOut_psiKP}']: {psi_k_for_final.bond(ct_lbl_opPOut_psiKP).type().name}")
+            
+            L_env_updated = cytnx.Contract(T2_for_final, psi_k_for_final)
+            
+            if k < L_psi - 1:
+                permute_target_order_on_L_env_updated = [unique_dangling_T2_psiCR, unique_dangling_T2_opR, unique_dangling_psiK_R]
+                current_L_updated_labels = L_env_updated.labels()
+                if not all(pt_lbl in current_L_updated_labels for pt_lbl in permute_target_order_on_L_env_updated):
+                    logger.error(f"Site {k} L_env_updated permute error: Expected labels {permute_target_order_on_L_env_updated} not all found in {current_L_updated_labels}.")
+                
+                L_env_perm = L_env_updated.permute(permute_target_order_on_L_env_updated, rowrank=1)
+                
+                bonds_for_next_L_env = []
+                for i_next_leg, next_leg_lbl_permuted in enumerate(L_env_perm.labels()):
+                    temp_bond = L_env_perm.bonds()[i_next_leg].clone()
+                    if temp_bond.type() != BD_OUT: # Ensure outgoing for next L_env
+                        temp_bond.redirect_()
+                    bonds_for_next_L_env.append(temp_bond)
+
+                L_env = UniTensor(
+                    bonds=bonds_for_next_L_env,
+                    labels=[env_LpsiC_lbl, env_Lop_lbl, env_LpsiK_lbl], 
+                    rowrank=1, dtype=effective_dtype, device=effective_device
                 )
-            return final_scalar_val.real
-        return float(final_scalar_val)
+                L_env.put_block(L_env_perm.get_block_())
+            else:
+                L_env = L_env_updated
+        
+        if not (L_env.rank() == 3 and L_env.shape() == [1,1,1] or L_env.is_scalar()):
+            logger.error(f"Final L_env error. Rank:{L_env.rank()},Shape:{L_env.shape()},Labels:{L_env.labels()}")
+            raise ValueError("Final L_env structure incorrect.")
+        
+        final_val = L_env.item()
+        # For logging dtype of final_val, which might be a Python scalar now
+        final_val_dtype_str = ""
+        if isinstance(final_val, complex):
+            final_val_dtype_str = "Python complex"
+        elif isinstance(final_val, float):
+            final_val_dtype_str = "Python float"
+        elif isinstance(final_val, int):
+            final_val_dtype_str = "Python int"
+        else: # Fallback for other types like numpy scalars if L_env.item() returns them
+            final_val_dtype_str = str(type(final_val))
+
+        logger.debug(f"Overlap_mps: L_psi={L_psi}, final val={final_val}, val_type={final_val_dtype_str}")
+
+        # Corrected return logic for final_val
+        if isinstance(final_val, complex):
+            if abs(final_val.imag) > 1e-9: 
+                logger.warning(f"Overlap_mps: Result {final_val} has a significant imaginary part. Returning .real part: {final_val.real}")
+            return final_val.real # Always return .real if it's a complex type
+        elif isinstance(final_val, (float, int, np.number)): # Handles float, int, and numpy real numeric types
+            return float(final_val)
+        else:
+            # This case should ideally not be reached if L_env.item() returns standard numerics
+            logger.error(f"Overlap_mps: final_val is of unexpected type {type(final_val)}. Value: {final_val}")
+            # Attempt to convert, or raise a more specific error
+            try:
+                return float(final_val) 
+            except TypeError as e:
+                raise TypeError(f"Cannot convert final_val (type {type(final_val)}, value {final_val}) to float for return. Original error: {e}")
+
+
 
 
 def build_physical_mps(d: int, L: int, dtype: cytnx.Type = cytnx.Type.Double, device: cytnx.Device = cytnx.Device.cpu) -> TensorTrain:
@@ -381,8 +496,8 @@ if __name__ == "__main__":
     print(f"Test 1 (d={d_std}, L={L_std}): Empty ProdOp overlap_mps")
     op_empty_std = ProdOp()
     res_test1 = op_empty_std.overlap_mps(mps_std)
-    print(f"  Calculated: {res_test1}, Expected: 0.0")
-    assert np.isclose(res_test1, 0.0), "Test Case 1 overlap_mps Failed"
+    print(f"  Calculated: {res_test1}, Expected: 81.0")
+    assert np.isclose(res_test1, 81.0), "Test Case 1 overlap_mps Failed"
 
     print(f"Test 2 (d={d_std}, L={L_std}): Identity MPO overlap_mps")
     ops_id_std = {i: ProdOp.one.clone() for i in range(L_std)} # Clone to be safe
@@ -487,7 +602,7 @@ if __name__ == "__main__":
     mps_merged_core_data = cytnx.ones([merged_phys_dim_mps], dtype=Type.Double, device=Device.cpu).reshape(1, merged_phys_dim_mps, 1)
     
     label_L_mrg = "L_bound"
-    label_P_mrg = f"p_mrg0" # Merged physical index for mps
+    label_P_mrg = "p_mrg0" # Merged physical index for mps
     label_R_mrg = "R_bound"
     
     bd_L_mrg = Bond(1, BD_IN)
