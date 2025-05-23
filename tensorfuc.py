@@ -16,7 +16,12 @@ class TensorFunction:
     providing optional caching via lru_cache and block evaluation.
     Mimics tensor_function.h.
     """
-    def __init__(self, func: Callable[[MultiIndex], Any], use_cache: bool = True):
+    """
+    Wraps a function that computes tensor elements f(vector<int>) -> T,
+    providing optional caching via lru_cache and block evaluation.
+    Mimics tensor_function.h.
+    """
+    def __init__(self, func: Callable[[MultiIndex], Any], use_cache: bool = True,localDim: Optional[list[int]] = None):
         """
         Initializes the Tensor Function wrapper.
 
@@ -26,12 +31,14 @@ class TensorFunction:
             use_cache: Whether to enable LRU caching for function calls.
         """
         if not callable(func):
-            raise TypeError("`func` must be a callable function.")
+            raise TypeError("func must be a callable function.")
 
         self._raw_func = func
         self.use_cache = use_cache
         self._cached_func = None
-
+        self.localDim = localDim 
+        self._cache: dict[tuple[int, ...], float] = {} if use_cache else None
+        
         if self.use_cache:
             # Using functools.lru_cache for caching
             self._cached_func = functools.lru_cache(maxsize=None)(self._raw_func)
