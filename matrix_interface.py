@@ -2,7 +2,7 @@
 
 from cytnx import Tensor, zeros, Type
 from IndexSet import IndexSet # Assuming IndexSet.py is available
-from typing import List, Tuple, Callable, Any, Dict, Optional # <--- Added Optional
+from typing import Tuple, Callable, Any, Dict # <--- Added Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -158,7 +158,7 @@ class IMatrixIndex(IMatrix):
                   P_for_set[old_idx_pos] = new_idx_pos
 
         if -1 in P_for_set:
-            logger.warning(f"set_rows: Could not map all old row indices to new ones.")
+            logger.warning("set_rows: Could not map all old row indices to new ones.")
             # Depending on how Mat{Dense/Lazy}.set_rows uses P, this might be an error
             # For now, return the potentially incomplete permutation
         return P_for_set
@@ -178,7 +178,7 @@ class IMatrixIndex(IMatrix):
                   old_idx_pos = old_map[new_idx_val]
                   Q_for_set[old_idx_pos] = new_idx_pos
         if -1 in Q_for_set:
-             logger.warning(f"set_cols: Could not map all old col indices to new ones.")
+             logger.warning("set_cols: Could not map all old col indices to new ones.")
         return Q_for_set
 
 

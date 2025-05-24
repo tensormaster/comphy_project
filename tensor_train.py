@@ -1,5 +1,5 @@
 import cytnx
-from cytnx import Bond
+from cytnx import linalg
 import pickle
 import numpy as np
 from itertools import product
@@ -11,7 +11,7 @@ from mat_decomp import MatprrLUFixedTol
 logger = logging.getLogger(__name__)
 
 # Cytnx core imports
-from cytnx import Tensor, UniTensor, Type, Device, BD_IN, BD_OUT, from_numpy, zeros, eye, linalg
+from cytnx import Tensor, UniTensor, Type, BD_IN, BD_OUT, from_numpy
 
 def _utt_assert_rank3(A_ut: cytnx.UniTensor, func_name: str):
     """
@@ -1382,7 +1382,7 @@ if __name__ == "__main__":
             TensorTrain._assert_core_validity(original_tt.M[k_assert], k_assert, L, check_data_presence=True)
         print("DEBUG: _assert_core_validity PASSED for all cores in original_tt.")
 
-    print(f"\nSuccessfully created TensorTrain with UniTensor cores.")
+    print("\nSuccessfully created TensorTrain with UniTensor cores.")
     print(f"Number of cores in original_tt: {len(original_tt.M)}")
     if original_tt.M:
         print(f"First core labels of original_tt: {original_tt.M[0].labels()}")

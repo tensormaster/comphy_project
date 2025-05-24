@@ -6,7 +6,6 @@ import cytnx
 from cytnx import *
 from AdaptiveLU import AdaptiveLU # Assuming AdaptiveLU.py is available
 from typing import Optional
-import numpy as np # Ensure numpy is imported if used for array conversion
 
 # Initialize logging for debugging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')

@@ -4,7 +4,7 @@ import random
 import numpy as np
 import cytnx
 from typing import List, Tuple, Optional, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # Assuming crossdata.py and matrix_interface.py are in the same directory
 # or accessible via PYTHONPATH

@@ -1,7 +1,6 @@
 import cytnx
 from cytnx import *
 import numpy as np
-import random
 from IndexSet import *  # 使用全局的 IndexSet 類
 
 def ensure_2d(t: Tensor, axis=0) -> Tensor:

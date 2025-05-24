@@ -1,5 +1,5 @@
 import functools
-from typing import Callable, Tuple, Any, Dict, Optional, List, Union
+from typing import Callable, Tuple, Any, Dict, List, Union
 import numpy as np
 import time
 import itertools

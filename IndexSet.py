@@ -1,5 +1,4 @@
 from cytnx import *
-import numpy as np
 
 # ---------------------------
 # 定義 IndexSet 類別（現有實現）

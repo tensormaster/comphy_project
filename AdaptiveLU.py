@@ -2,7 +2,6 @@ import logging
 import cytnx
 from cytnx import *
 import numpy as np
-import random
 from IndexSet import *  # Assuming IndexSet class is defined elsewhere
 
 # 初始化 logging
@@ -70,7 +69,7 @@ def manual_vstack(tensor1: cytnx.Tensor, tensor2: cytnx.Tensor) -> cytnx.Tensor:
 
 
 class AdaptiveLU:
-    def __init__(self, n_rows: int, n_cols: int, verbose: bool = False, pivot_method: str = "full", tol: float = 1e-6):
+    def __init__(self, n_rows: int, n_cols: int, verbose: bool = False, pivot_method: str = "full", tol: float = 1e-6, rankmax: int = 100):
         """
         Initialize the AdaptiveLU decomposition class.
 
@@ -85,6 +84,7 @@ class AdaptiveLU:
         self.verbose = verbose
         self.pivot_method = pivot_method
         self.tol = tol
+        self.rankmax = rankmax  # Maximum rank to consider
         self.Iset = []  # Selected row indices
         self.Jset = []  # Selected column indices
         self.L = cytnx.eye(n_rows, dtype=Type.Double, device=Device.cpu)  # Lower triangular matrix
@@ -238,6 +238,8 @@ class AdaptiveLU:
         """Perform the rank-revealing LU decomposition."""
         Temp = M.clone()
         N = min(self.n_rows, self.n_cols)
+        if self.rankmax < N:
+            N = self.rankmax
         for i in range(N):
             subN, subM = self.n_rows - i, self.n_cols - i
             if subN < 1 or subM < 1:
