@@ -100,68 +100,27 @@ def mat_AB1(A: Tensor, B: Tensor) -> Tensor:
         if Qb.shape()[0] != Qb.shape()[1] or Qb.shape()[0] == 0 : 
              raise RuntimeError(f"Qb (shape {Qb.shape()}) is not square or is empty, cannot invert.")
         
-        Qb_inv: Tensor
-        # --- START TEMPORARY WORKAROUND for cytnx.linalg.Inv issue ---
-        # Original algorithm: Qb_inv = linalg.Inv(Qb, clip=1e-14)
-        # Reason for workaround: cytnx.linalg.Inv was observed to return zero for non-zero [1,1] tensors.
-        if Qb.shape() == [1, 1]:
-            # 手動求逆 1x1 矩陣以避免潛在的 cytnx.linalg.Inv 問題。
-            # 如果 cytnx.linalg.Inv 函式庫修復了對 [1,1] 矩陣的正確求逆，此處應改回原始算法。
-            val = Qb.item() # Extract scalar value
-            if abs(val) < 1e-14: # Check for near-zero value, consistent with clip tolerance
-                logger.warning(f"mat_AB1 (QR): Qb value {val} is near zero. Returning zero inverse for this element.")
-                Qb_inv = cytnx.zeros((1,1), dtype=Qb.dtype(), device=Qb.device())
-            else:
-                # Create a new 1x1 tensor with the inverse value
-                Qb_inv = cytnx.from_numpy(np.array([[1.0 / val]], dtype=Qb.numpy().dtype)).to(Qb.device()).astype(Qb.dtype())
-            logger.debug(f"mat_AB1 (QR - Manual Qb_inv): Qb_inv shape: {Qb_inv.shape()}, content:\n{Qb_inv.numpy()}") # DEBUG
-        else:
-            # Fallback to cytnx.linalg.Inv for larger matrices or if direct inversion is not for [1,1]
-            Qb_inv = linalg.Inv(Qb, clip=1e-14) 
-            logger.debug(f"mat_AB1 (QR - cytnx.linalg.Inv): Qb_inv shape: {Qb_inv.shape()}, content:\n{Qb_inv.numpy()}") # DEBUG
+        # --- START TEMPORARY WORKAROUND for cytnx.linalg.Inv issue with small matrices ---
+        # Original: Qb_inv = linalg.Inv(Qb, clip=1e-14)
+        # Reason for workaround: cytnx.linalg.Inv was observed to return incorrect results for small matrices (e.g., [1,1] or [2,2]).
+        # Using linalg.Lstsq to solve X @ Qb = Qa for X (i.e., X = Qa @ Qb^-1) which is more stable.
+        # Solve (Qb^T) @ X^T = Qa^T for X^T, then transpose X^T to get X.
+        result_transpose_list = linalg.Lstsq(Qb.permute(1,0), Qa.permute(1,0), rcond=1e-14)
+        result_transpose = result_transpose_list[0] # Extract Tensor from list
+        result = result_transpose.permute(1,0) # Transpose back
         # --- END TEMPORARY WORKAROUND ---
 
-        result = Qa @ Qb_inv
         logger.debug(f"mat_AB1 (QR): Result shape {result.shape()}, content:\n{result.numpy()}") # DEBUG
-        return result.astype(A.dtype()) 
+        return result.astype(A.dtype())
         
     except RuntimeError as e:
-        logger.warning(f"mat_AB1: QR-based method failed ({e}). Falling back to A @ Inv(B) or pseudo-inverse.")
-        try:
-            # Original algorithm: return A @ linalg.Inv(B, clip=1e-14)
-            # Reason for workaround: 同上，若 B 為 [1,1] 且有 cytnx.linalg.Inv 問題，此處需注意。
-            B_inv: Tensor
-            if B.shape() == [1,1]:
-                val_B = B.item()
-                if abs(val_B) < 1e-14:
-                    B_inv = cytnx.zeros((1,1), dtype=B.dtype(), device=B.device())
-                else:
-                    B_inv = cytnx.from_numpy(np.array([[1.0 / val_B]], dtype=B.numpy().dtype)).to(B.device()).astype(B.dtype())
-            else:
-                B_inv = linalg.Inv(B, clip=1e-14)
-            return A @ B_inv
-
-        except RuntimeError:
-            logger.warning("mat_AB1: Direct Inv(B) failed. Attempting pseudo-inverse via Svd.")
-            Ub, Sb_vec, Vhb = linalg.Svd(B.contiguous(), is_U=True, is_Vt=True)
-            Sb_pinv_vec = cytnx.zeros_like(Sb_vec)
-            tol_pinv = 1e-14 * Sb_vec[0].item() if Sb_vec.shape()[0] > 0 else 1e-14
-            for i in range(Sb_vec.shape()[0]):
-                if abs(Sb_vec[i].item()) > tol_pinv:
-                    Sb_pinv_vec[i] = 1.0 / Sb_vec[i].item()
-            
-            S_pinv_mat = cytnx.zeros((Vhb.shape()[0], Ub.shape()[0]), dtype=Sb_vec.dtype(), device=Sb_vec.device())
-            min_dim_s = min(S_pinv_mat.shape())
-            for i in range(min_dim_s):
-                 if i < Sb_pinv_vec.shape()[0]:
-                    S_pinv_mat[i,i] = Sb_pinv_vec[i]
-            
-            # Vhb is Vt, so V = Vt.permute(1,0). For B_pinv = V S_pinv Ut
-            V_ct = Vhb.contiguous().permute(1, 0) 
-            U_ct_T = Ub.contiguous().permute(1,0)
-            B_pinv = V_ct @ S_pinv_mat @ U_ct_T
-            return A @ B_pinv
-
+        # Fallback to direct A @ B^-1 if QR fails. Use Lstsq for inverse part for stability.
+        logger.warning(f"mat_AB1: QR-based method failed ({e}). Falling back to A @ Inv(B) or pseudo-inverse via Lstsq.")
+        # Solves X B = A (for X), which is equivalent to solving B^T X^T = A^T
+        lstsq_result_list = linalg.Lstsq(B.permute(1,0), A.permute(1,0), rcond=1e-14)
+        lstsq_result = lstsq_result_list[0] # Extract Tensor from list
+        return lstsq_result.permute(1,0).astype(A.dtype())
+        
 def mat_A1B(A: Tensor, B: Tensor) -> Tensor:
     """
     Computes A^-1 @ B in a stable way using QR decomposition, mimicking C++ xfac::mat_A1B.
@@ -212,33 +171,27 @@ def mat_A1B(A: Tensor, B: Tensor) -> Tensor:
         if Qa_from_Q.shape()[0] != Qa_from_Q.shape()[1] or Qa_from_Q.shape()[0] == 0:
             raise RuntimeError(f"Qa_from_Q (shape {Qa_from_Q.shape()}) is not square or is empty, cannot invert.")
 
-        InvQa: Tensor
-        # --- START TEMPORARY WORKAROUND for cytnx.linalg.Inv issue ---
-        # Original algorithm: InvQa = linalg.Inv(Qa_from_Q, clip=1e-14)
-        # Reason for workaround: cytnx.linalg.Inv was observed to return zero for non-zero [1,1] tensors.
-        if Qa_from_Q.shape() == [1, 1]:
-            # 手動求逆 1x1 矩陣以避免潛在的 cytnx.linalg.Inv 問題。
-            # 如果 cytnx.linalg.Inv 函式庫修復了對 [1,1] 矩陣的正確求逆，此處應改回原始算法。
-            val = Qa_from_Q.item() # Extract scalar value
-            if abs(val) < 1e-14: # Check for near-zero value, consistent with clip
-                logger.warning(f"mat_A1B (QR): Qa_from_Q value {val} is near zero. Returning zero inverse for this element.")
-                InvQa = cytnx.zeros((1,1), dtype=Qa_from_Q.dtype(), device=Qa_from_Q.device())
-            else:
-                # Create a new 1x1 tensor with the inverse value
-                InvQa = cytnx.from_numpy(np.array([[1.0 / val]], dtype=Qa_from_Q.numpy().dtype)).to(Qa_from_Q.device()).astype(Qa_from_Q.dtype())
-            logger.debug(f"mat_A1B (QR - Manual InvQa): InvQa shape: {InvQa.shape()}, content:\n{InvQa.numpy()}") # DEBUG
-        else:
-            # Fallback to cytnx.linalg.Inv for larger matrices or if direct inversion is not for [1,1]
-            InvQa = linalg.Inv(Qa_from_Q, clip=1e-14)
-            logger.debug(f"mat_A1B (QR - cytnx.linalg.Inv): InvQa shape: {InvQa.shape()}, content:\n{InvQa.numpy()}") # DEBUG
-        # --- END TEMPORARY WORKAROUND ---
+        # --- START TEMPORARY WORKAROUND for cytnx.linalg.Inv issue with small matrices ---
+        # Original: InvQa = linalg.Inv(Qa_from_Q, clip=1e-14)
+        # Reason for workaround: cytnx.linalg.Inv was observed to return incorrect results for small matrices (e.g., [1,1] or [2,2]).
+        # Using linalg.Lstsq to solve Qa_from_Q @ X = Qb_from_Q for X (i.e., X = Qa_from_Q^-1 @ Qb_from_Q) which is more stable.
         
-        InvQa_T = InvQa.permute(1,0)
-        Qb_from_Q_T = Qb_from_Q.permute(1,0)
-        result = InvQa_T @ Qb_from_Q_T 
+        # --- START TEMPORARY WORKAROUND for cytnx.linalg.Inv issue with small matrices ---
+        # Original: InvQa = linalg.Inv(Qa_from_Q, clip=1e-14)
+        # Reason for workaround: cytnx.linalg.Inv was observed to return incorrect results for small matrices (e.g., [1,1] or [2,2]).
+        # Using linalg.Lstsq to solve (Qa_from_Q^T) @ X = (Qb_from_Q^T) for X,
+        # where X is the desired (Qa_from_Q^-1)^T @ Qb_from_Q^T result.
+        lstsq_intermediate_result_list = linalg.Lstsq(Qa_from_Q.permute(1,0), Qb_from_Q.permute(1,0), rcond=1e-14)
+        result = lstsq_intermediate_result_list[0] # Extract Tensor from list
+        # This 'result' now directly holds (Qa_from_Q^T)^-1 @ Qb_from_Q^T
+        # which is the mathematical expression for A^-1 B from the QR derivation.
+        # --- END TEMPORARY WORKAROUND ---
         logger.debug(f"mat_A1B (QR): Result shape {result.shape()}, content:\n{result.numpy()}") # DEBUG
         return result.astype(A.dtype())
 
     except RuntimeError as e:
         logger.warning(f"mat_A1B: QR-based method failed ({e}). Falling back to linalg.Lstsq(A, B).")
-        return linalg.Lstsq(A.contiguous(), B.contiguous(), clip=1e-14)
+        # This directly solves A X = B, which is A^-1 B.
+        lstsq_result_list = linalg.Lstsq(A.contiguous(), B.contiguous(), rcond=1e-14)
+        lstsq_result = lstsq_result_list[0] # Extract Tensor from list
+        return lstsq_result.astype(A.dtype())
