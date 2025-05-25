@@ -3,8 +3,12 @@ import cytnx
 from cytnx import UniTensor, Tensor, BD_IN, BD_OUT, linalg, Type # Ensure Type is imported
 from typing import Tuple
 import logging
+import numpy as np # Import numpy for manual inversion
 
 logger = logging.getLogger(__name__)
+# 這裡不需要重複設置logger.setLevel，因為在 tensor_ci.py 中已經通過 basicConfig 設置了 DEBUG 級別
+# 並且每個模組的 logger 默認會繼承 root logger 的級別。
+# 如果想確保，可以在主腳本或入口點統一設置 root logger。
 
 def cube_as_matrix1(core: UniTensor) -> Tensor:
     """
@@ -55,6 +59,7 @@ def mat_AB1(A: Tensor, B: Tensor) -> Tensor:
     B: Tensor of shape (n, n) (must be square and invertible for this QR method)
     Returns A @ B^-1, shape (m, n)
     """
+    logger.debug(f"mat_AB1 called: A shape {A.shape()}, B shape {B.shape()}") # DEBUG
     if not (isinstance(A, Tensor) and isinstance(B, Tensor)):
         raise TypeError("Inputs A and B must be cytnx.Tensors.")
     if A.shape()[1] != B.shape()[0]: 
@@ -91,18 +96,51 @@ def mat_AB1(A: Tensor, B: Tensor) -> Tensor:
         Qa = Q[:m_A, :]      
         Qb = Q[m_A:m_A+n_B_rows, :]
 
+        logger.debug(f"mat_AB1 (QR): Qb shape: {Qb.shape()}, content:\n{Qb.numpy()}") # DEBUG added
         if Qb.shape()[0] != Qb.shape()[1] or Qb.shape()[0] == 0 : 
              raise RuntimeError(f"Qb (shape {Qb.shape()}) is not square or is empty, cannot invert.")
-             
-        Qb_inv = linalg.Inv(Qb, clip=1e-14) 
+        
+        Qb_inv: Tensor
+        # --- START TEMPORARY WORKAROUND for cytnx.linalg.Inv issue ---
+        # Original algorithm: Qb_inv = linalg.Inv(Qb, clip=1e-14)
+        # Reason for workaround: cytnx.linalg.Inv was observed to return zero for non-zero [1,1] tensors.
+        if Qb.shape() == [1, 1]:
+            # 手動求逆 1x1 矩陣以避免潛在的 cytnx.linalg.Inv 問題。
+            # 如果 cytnx.linalg.Inv 函式庫修復了對 [1,1] 矩陣的正確求逆，此處應改回原始算法。
+            val = Qb.item() # Extract scalar value
+            if abs(val) < 1e-14: # Check for near-zero value, consistent with clip tolerance
+                logger.warning(f"mat_AB1 (QR): Qb value {val} is near zero. Returning zero inverse for this element.")
+                Qb_inv = cytnx.zeros((1,1), dtype=Qb.dtype(), device=Qb.device())
+            else:
+                # Create a new 1x1 tensor with the inverse value
+                Qb_inv = cytnx.from_numpy(np.array([[1.0 / val]], dtype=Qb.numpy().dtype)).to(Qb.device()).astype(Qb.dtype())
+            logger.debug(f"mat_AB1 (QR - Manual Qb_inv): Qb_inv shape: {Qb_inv.shape()}, content:\n{Qb_inv.numpy()}") # DEBUG
+        else:
+            # Fallback to cytnx.linalg.Inv for larger matrices or if direct inversion is not for [1,1]
+            Qb_inv = linalg.Inv(Qb, clip=1e-14) 
+            logger.debug(f"mat_AB1 (QR - cytnx.linalg.Inv): Qb_inv shape: {Qb_inv.shape()}, content:\n{Qb_inv.numpy()}") # DEBUG
+        # --- END TEMPORARY WORKAROUND ---
+
         result = Qa @ Qb_inv
+        logger.debug(f"mat_AB1 (QR): Result shape {result.shape()}, content:\n{result.numpy()}") # DEBUG
         return result.astype(A.dtype()) 
         
     except RuntimeError as e:
         logger.warning(f"mat_AB1: QR-based method failed ({e}). Falling back to A @ Inv(B) or pseudo-inverse.")
         try:
-            B_inv = linalg.Inv(B, clip=1e-14) 
+            # Original algorithm: return A @ linalg.Inv(B, clip=1e-14)
+            # Reason for workaround: 同上，若 B 為 [1,1] 且有 cytnx.linalg.Inv 問題，此處需注意。
+            B_inv: Tensor
+            if B.shape() == [1,1]:
+                val_B = B.item()
+                if abs(val_B) < 1e-14:
+                    B_inv = cytnx.zeros((1,1), dtype=B.dtype(), device=B.device())
+                else:
+                    B_inv = cytnx.from_numpy(np.array([[1.0 / val_B]], dtype=B.numpy().dtype)).to(B.device()).astype(B.dtype())
+            else:
+                B_inv = linalg.Inv(B, clip=1e-14)
             return A @ B_inv
+
         except RuntimeError:
             logger.warning("mat_AB1: Direct Inv(B) failed. Attempting pseudo-inverse via Svd.")
             Ub, Sb_vec, Vhb = linalg.Svd(B.contiguous(), is_U=True, is_Vt=True)
@@ -131,6 +169,7 @@ def mat_A1B(A: Tensor, B: Tensor) -> Tensor:
     B: Tensor of shape (m, n)
     Returns A^-1 @ B, shape (m, n)
     """
+    logger.debug(f"mat_A1B called: A shape {A.shape()}, B shape {B.shape()}") # DEBUG
     if not (isinstance(A, Tensor) and isinstance(B, Tensor)):
         raise TypeError("Inputs A and B must be cytnx.Tensors.")
     if A.shape()[0] != A.shape()[1]:
@@ -169,14 +208,35 @@ def mat_A1B(A: Tensor, B: Tensor) -> Tensor:
         Qb_from_Q = Q[:n_BT, :]      
         Qa_from_Q = Q[n_BT:n_BT+n_AT, :]
 
+        logger.debug(f"mat_A1B (QR): Qa_from_Q shape: {Qa_from_Q.shape()}, content:\n{Qa_from_Q.numpy()}") # DEBUG added
         if Qa_from_Q.shape()[0] != Qa_from_Q.shape()[1] or Qa_from_Q.shape()[0] == 0:
             raise RuntimeError(f"Qa_from_Q (shape {Qa_from_Q.shape()}) is not square or is empty, cannot invert.")
 
-        InvQa = linalg.Inv(Qa_from_Q, clip=1e-14) 
+        InvQa: Tensor
+        # --- START TEMPORARY WORKAROUND for cytnx.linalg.Inv issue ---
+        # Original algorithm: InvQa = linalg.Inv(Qa_from_Q, clip=1e-14)
+        # Reason for workaround: cytnx.linalg.Inv was observed to return zero for non-zero [1,1] tensors.
+        if Qa_from_Q.shape() == [1, 1]:
+            # 手動求逆 1x1 矩陣以避免潛在的 cytnx.linalg.Inv 問題。
+            # 如果 cytnx.linalg.Inv 函式庫修復了對 [1,1] 矩陣的正確求逆，此處應改回原始算法。
+            val = Qa_from_Q.item() # Extract scalar value
+            if abs(val) < 1e-14: # Check for near-zero value, consistent with clip
+                logger.warning(f"mat_A1B (QR): Qa_from_Q value {val} is near zero. Returning zero inverse for this element.")
+                InvQa = cytnx.zeros((1,1), dtype=Qa_from_Q.dtype(), device=Qa_from_Q.device())
+            else:
+                # Create a new 1x1 tensor with the inverse value
+                InvQa = cytnx.from_numpy(np.array([[1.0 / val]], dtype=Qa_from_Q.numpy().dtype)).to(Qa_from_Q.device()).astype(Qa_from_Q.dtype())
+            logger.debug(f"mat_A1B (QR - Manual InvQa): InvQa shape: {InvQa.shape()}, content:\n{InvQa.numpy()}") # DEBUG
+        else:
+            # Fallback to cytnx.linalg.Inv for larger matrices or if direct inversion is not for [1,1]
+            InvQa = linalg.Inv(Qa_from_Q, clip=1e-14)
+            logger.debug(f"mat_A1B (QR - cytnx.linalg.Inv): InvQa shape: {InvQa.shape()}, content:\n{InvQa.numpy()}") # DEBUG
+        # --- END TEMPORARY WORKAROUND ---
         
         InvQa_T = InvQa.permute(1,0)
         Qb_from_Q_T = Qb_from_Q.permute(1,0)
         result = InvQa_T @ Qb_from_Q_T 
+        logger.debug(f"mat_A1B (QR): Result shape {result.shape()}, content:\n{result.numpy()}") # DEBUG
         return result.astype(A.dtype())
 
     except RuntimeError as e:
