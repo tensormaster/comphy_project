@@ -493,8 +493,8 @@ class TensorCI1:
             self.pivFinder[p_bond] = PivotFinder(param=finder_param_p)
 
         if self.param.nIter > 0 and num_bonds > 0 :
-            logger.info(f"__init__: Running {self.param.nIter} initial TCI iterations.")
-            for _ in range(self.param.nIter): self.iterate_one_full_sweep()
+            logger.info(f"__init__: Running {self.param.nIter} initial TCI iterations using IterateN.")
+            self.IterateN(self.param.nIter) # Call IterateN to handle sweeps and set self.done
 
 
     def get_TP1_at(self, p_bond: int) -> Optional[cytnx.UniTensor]:
