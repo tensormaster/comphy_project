@@ -1,13 +1,13 @@
-# filename: crossdata.py (Further Corrected)
+# filename: crossdata.py (Further Corrected - Attempt 5: Using manual_vstack)
 
 import logging
 import numpy as np
 import cytnx
 from cytnx import Tensor
 # Make sure IMatrix is imported if it's defined in another file
-from matrix_interface import IMatrix # Assuming IMatrix is in matrix_interface.py
-from AdaptiveLU import AdaptiveLU 
-from typing import Optional, List, Dict, Any, Union # Added Union
+from matrix_interface import IMatrix
+from AdaptiveLU import AdaptiveLU
+from typing import Optional, List, Dict, Any, Union
 
 logger = logging.getLogger(__name__)
 
@@ -15,9 +15,9 @@ def ensure_2d(t: Tensor, axis=0) -> Tensor:
     shape = t.shape()
     if len(shape) == 1:
         n = shape[0]
-        if axis == 0: 
-            t2 = t.reshape(n, 1) 
-        else: 
+        if axis == 0:
+            t2 = t.reshape(n, 1)
+        else:
             t2 = t.reshape(1, n)
         # logger.debug(f"ensure_2d: Reshaped tensor from {shape} to {t2.shape()}") # Optional: less verbose
         return t2
@@ -49,8 +49,8 @@ class CrossData:
     def __init__(self, n_rows: int, n_cols: int):
         self.n_rows = n_rows
         self.n_cols = n_cols
-        self.C: Optional[Tensor] = None 
-        self.R: Optional[Tensor] = None 
+        self.C: Optional[Tensor] = None
+        self.R: Optional[Tensor] = None
         self.lu = AdaptiveLU(n_rows, n_cols)
         self.cache: Dict[str, Any] = {'LD': None, 'I_avail': None, 'J_avail': None}
         logger.debug(f"Initialized CrossData with {n_rows} rows and {n_cols} columns.")
@@ -59,7 +59,7 @@ class CrossData:
         if self.C is None or not isinstance(self.lu.Iset, (list, tuple)) or not self.lu.Iset:
             logger.debug("pivotMat: C is None or lu.Iset is empty. Returning None.")
             return None
-        
+
         current_rank = self.rank()
         if current_rank == 0:
             logger.debug("pivotMat: Current rank is 0. Returning None.")
@@ -67,32 +67,43 @@ class CrossData:
 
         try:
             iset_np = np.array(self.lu.Iset, dtype=np.int64)
-            if iset_np.size == 0: # Should be caught by current_rank == 0
+            if iset_np.size == 0:
                 logger.warning("pivotMat: Iset is effectively empty. Returning None.")
                 return None
+
+            # Check bounds before proceeding with slicing/taking
             if np.max(iset_np) >= self.C.shape()[0]:
                 logger.error(f"pivotMat: Max Iset index {np.max(iset_np)} out of bounds for C shape {self.C.shape()}.")
                 return None
 
-            # Slice to get the pivot block: A[I_pivots, J_pivots]
-            # Assuming self.C = A[:, J_pivots_lu_ordered]
-            # So self.C has shape (original_num_rows, current_rank)
-            # We need to select rows from self.C based on iset_np (which are original row indices)
-            # And then select columns from this result.
-            # Actually, self.C ALREADY has only the pivot columns from AdaptiveLU.
-            # So self.C[iset_np, :] should give A[I_pivots, J_pivots_lu_ordered].
-            pivot_matrix_candidate = self.C[iset_np, :]
+            # --- MODIFICATION START (Attempt 5: Using manual_vstack for concatenation) ---
+            pivot_matrix_candidate: Optional[Tensor] = None
+            if iset_np.size > 0:
+                # Get the first row
+                first_row = self.C[iset_np[0], :]
+                pivot_matrix_candidate = ensure_2d(first_row, axis=1) # Ensure (1, N)
+
+                # Manually vstack subsequent rows
+                for i in range(1, iset_np.size):
+                    next_row = self.C[iset_np[i], :]
+                    pivot_matrix_candidate = manual_vstack(pivot_matrix_candidate, ensure_2d(next_row, axis=1))
+            else:
+                # If no rows selected, return an empty matrix with correct column dimension
+                # This case is already covered by iset_np.size == 0 check above, but for completeness.
+                pivot_matrix_candidate = cytnx.zeros((0, self.C.shape()[1]), dtype=self.C.dtype(), device=self.C.device())
+
+            if pivot_matrix_candidate is None:
+                logger.error("pivotMat: Failed to create pivot_matrix_candidate due to unexpected None state.")
+                return None
+            # --- MODIFICATION END ---
 
             # --- 修正開始：確保 pivot_matrix 是 2D 且形狀正確 ---
             if current_rank == 1:
-                # If rank is 1, C[iset_np, :] might return a 1D tensor of shape [1] if C was (N,1)
-                # or if iset_np selected a single row from a multi-column C.
-                # We need it to be (1,1) for consistency.
-                if pivot_matrix_candidate.shape() == [1]: # It's 1D, shape [1]
+                if pivot_matrix_candidate.shape() == [1]:
                     pivot_matrix = pivot_matrix_candidate.reshape(1, 1)
-                elif pivot_matrix_candidate.shape() == [current_rank, current_rank]: # Already 2D [1,1]
+                elif pivot_matrix_candidate.shape() == [current_rank, current_rank]:
                     pivot_matrix = pivot_matrix_candidate
-                else: # Unexpected shape
+                else:
                     logger.warning(f"pivotMat: Rank 1 pivot_matrix_candidate shape is {pivot_matrix_candidate.shape()}, expected [1] or [1,1]. Returning None.")
                     return None
             elif pivot_matrix_candidate.rank() == 2 and \
@@ -104,13 +115,14 @@ class CrossData:
                                f"is not 2D or not rank x rank ({current_rank}x{current_rank}). Returning None.")
                 return None
             # --- 修正結束 ---
-            
+
             logger.debug(f"pivotMat: Successfully created pivot matrix of shape: {pivot_matrix.shape()}")
             return pivot_matrix
         except Exception as e:
             logger.error(f"pivotMat: Error: {e}", exc_info=True)
             return None
-    
+
+    # ... (rest of the CrossData class and test script remains the same) ...
     def rank(self) -> int:
         current_rank = len(self.lu.Iset) if isinstance(self.lu.Iset, (list, tuple)) else 0
         return current_rank
@@ -145,20 +157,20 @@ class CrossData:
         if row_tensor_extracted is None: return
 
         logger.debug(f"[addPivotRow] Extracted row tensor for index {i}, shape={row_tensor_extracted.shape()}")
-        
+
         # Ensure it's 2D (1, num_cols_A) for vstacking into R
         # Assuming row_tensor_extracted is 1D
         row_2d = ensure_2d(row_tensor_extracted.clone(), axis=1) # axis=1 for (1, N)
 
         if self.R is None:
-            self.R = row_2d 
+            self.R = row_2d
         else:
             if self.R.shape()[1] != row_2d.shape()[1]:
                 logger.error(f"addPivotRow: Mismatch in columns for vstack. R_cols: {self.R.shape()[1]}, row_cols: {row_2d.shape()[1]}"); return
             self.R = manual_vstack(self.R, row_2d)
         logger.debug(f"addPivotRow: Updated R, new shape: {self.R.shape()}.")
-        
-        self.lu.add_pivot_row(i, row_tensor_extracted) 
+
+        self.lu.add_pivot_row(i, row_tensor_extracted)
         self.cache = {'LD': None, 'I_avail': None, 'J_avail': None}
 
     def addPivotCol(self, j: int, A: Union[IMatrix, Tensor]): # A can be IMatrix or Tensor
@@ -185,7 +197,7 @@ class CrossData:
                 logger.error(f"addPivotCol (Tensor): Error slicing tensor: {e}"); return
         else:
             logger.error(f"addPivotCol: Unsupported type for A: {type(A)}"); return
-            
+
         if col_tensor_extracted is None: return
 
         logger.debug(f"[addPivotCol] Extracted col tensor for index {j}, shape={col_tensor_extracted.shape()}")
@@ -198,7 +210,7 @@ class CrossData:
             self.C = col_2d
         else:
             if self.C.shape()[0] != col_2d.shape()[0]:
-                logger.error(f"addPivotCol: Mismatch in rows for hstack. C_rows: {self.C.shape()[0]}, col_rows: {col_2d.shape()[0]}"); return
+                logger.error(f"addPivotCol: Mismatch in rows for hstack. C_cols: {self.C.shape()[0]}, col_rows: {col_2d.shape()[0]}"); return
             self.C = manual_hstack(self.C, col_2d)
         logger.debug(f"addPivotCol: Updated C, new shape: {self.C.shape()}.")
 
@@ -208,16 +220,16 @@ class CrossData:
     def addPivot(self, i: int, j: int, A: Union[IMatrix, Tensor]): # A can be IMatrix or Tensor
         logger.debug(f"addPivot: Adding pivot at ({i}, {j}) from A (type: {type(A)}).")
         # These calls will now correctly dispatch based on A's type (once IMatrix has get_... methods)
-        self.addPivotRow(i, A) 
-        self.addPivotCol(j, A) 
-    
+        self.addPivotRow(i, A)
+        self.addPivotCol(j, A)
+
     def mat(self) -> Optional[Tensor]: # Can return None if rank is 0 or error
         logger.debug("mat: Reconstructing matrix.")
         if self.rank() == 0:
             logger.debug("mat: Rank is 0, returning zero matrix.")
             # Ensure dtype and device are consistent, e.g., taken from lu or init params
             # For simplicity, using default for now if not otherwise available
-            default_dtype = cytnx.Type.Double 
+            default_dtype = cytnx.Type.Double
             default_device = cytnx.Device.cpu
             if self.lu and hasattr(self.lu, 'L') and self.lu.L is not None : # Try to get from LU if possible
                 default_dtype = self.lu.L.dtype()
@@ -234,7 +246,7 @@ class CrossData:
         except Exception as e:
             logger.error(f"mat: Error during lu.reconstruct: {e}", exc_info=True)
             return None # Return None on error to be handled by caller
-        
+
 
     def leftMat(self) -> Optional[Tensor]:
 
@@ -401,7 +413,7 @@ if __name__ == "__main__":
     # or rely on the hasattr checks.
     # To make this script runnable standalone before matrix_interface.py is fixed,
     # you could add a dummy IMatrix class here for the type hint if needed:
-    # class IMatrix: pass 
+    # class IMatrix: pass
 
     logger.setLevel(logging.INFO)
     logger.debug("Starting debug of CrossData with random matrix.")
@@ -414,7 +426,7 @@ if __name__ == "__main__":
     logger.info(f"{A_tensor}") # Cytnx tensors are directly printable
 
     cross_data = CrossData(M, N)
-    
+
     # --- Diagnostic prints from previous suggestion (can be kept or removed) ---
     logger.info(f"cross_data object type: {type(cross_data)}")
     if hasattr(cross_data, 'rank') and callable(cross_data.rank):
@@ -428,11 +440,11 @@ if __name__ == "__main__":
     MAX_RANK_TO_ADD = min(M, N)
     for k in range(MAX_RANK_TO_ADD):
         logger.info(f"--- Iteration {k+1} ---")
-        Aapprox = cross_data.mat() 
+        Aapprox = cross_data.mat()
         if Aapprox is None:
             logger.error("Aapprox is None, cannot compute residual. Stopping.")
             break
-            
+
         residual = A_tensor - Aapprox # Use A_tensor
 
         current_Iset = set(cross_data.lu.Iset if isinstance(cross_data.lu.Iset, (list, tuple)) else [])
@@ -445,10 +457,10 @@ if __name__ == "__main__":
         if current_Jset:
             for idx in list(current_Jset):
                 if 0 <= idx < mask.shape()[1]: mask[:, idx] = 0.0
-        
+
         masked_residual = residual * mask
         abs_residual = cytnx.linalg.Abs(masked_residual)
-        
+
         if not (abs_residual.shape()[0] > 0 and abs_residual.shape()[1] > 0): break
         flat_residual = abs_residual.reshape(-1)
         if not (flat_residual.shape()[0] > 0): break
@@ -473,9 +485,9 @@ if __name__ == "__main__":
         i, j = max_idx // num_cols_res, max_idx % num_cols_res
 
         logger.info(f"Found pivot at ({i}, {j}), resid_val={residual[i,j].item():.4f} (masked_abs_max={max_val:.4f})")
-        
+
         # Pass the original full Tensor A_tensor to addPivot
-        cross_data.addPivot(i, j, A_tensor) 
+        cross_data.addPivot(i, j, A_tensor)
         logger.info(f"Rank after adding: {cross_data.rank()}")
 
     logger.info("--- Final Results ---")
