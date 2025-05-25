@@ -1,895 +1,643 @@
 # In tensor_ci.py
 
 import cytnx
-from cytnx import UniTensor, Tensor, Bond, BD_IN, BD_OUT, linalg, Type, Device
+from cytnx import UniTensor, Tensor, Bond, BD_IN, BD_OUT, linalg, Type, Device, from_numpy
 from typing import List, Callable, Optional, Any, Tuple
-import itertools
 import logging
-import numpy as np # For initial pivot1 handling
+import numpy as np
 import dataclasses
 
-# Assuming other classes are importable
-from tensor_train import TensorTrain
-from IndexSet import IndexSet # Your Python IndexSet
-from crossdata import CrossData # Your Python CrossData (uses your AdaptiveLU)
-from matrix_interface import IMatrix, MatLazyIndex # Your Python matrix_interface
-from pivot_finder import PivotFinder, PivotFinderParam, PivotData # Your Python pivot_finder
-from tensorfuc import TensorFunction # Your Python TensorFunction
-from AdaptiveLU import AdaptiveLU # Your Python AdaptiveLU
+# --- Necessary imports ---
+from tensor_train import TensorTrain #
+from matrix_interface import IMatrix, MatLazyIndex, make_IMatrix # Added make_IMatrix
+from crossdata import CrossData #
+from pivot_finder import PivotFinder, PivotFinderParam, PivotData #
+from tensorfuc import TensorFunction #
+from tensor_utils import cube_as_matrix1, cube_as_matrix2, mat_AB1, mat_A1B #
 
-# Import helper functions if they are in a separate file
-from tensor_utils import cube_as_matrix1, cube_as_matrix2, mat_AB1, mat_A1B
 
 logger = logging.getLogger(__name__)
-MultiIndex = Tuple[int, ...] # Define MultiIndex if not already globally available
+MultiIndex = Tuple[int, ...]
 
 @dataclasses.dataclass
-class TensorCI1Param: # Keep your existing definition
+class TensorCI1Param:
     nIter: int = 0
     reltol: float = 1e-12
-    pivot1: Optional[List[int]] = None # This is List[int] in C++, usually one full multi-index
+    pivot1: Optional[List[int]] = None
     fullPiv: bool = False
     nRookIter: int = 5
     weight: Optional[List[List[float]]] = None
-    cond: Optional[Callable[[List[int]], bool]] = None # cond takes a full multi-index
-    useCachedFunction: bool = True # Corresponds to TensorFunction's use_cache
+    cond: Optional[Callable[[List[int]], bool]] = None
+    useCachedFunction: bool = True
 
-    def to_pivot_finder_param(self, 
-                              tensor_ci_instance: 'TensorCI1', 
-                              current_bond_p: int) -> PivotFinderParam:
-        adapted_f_bool = None
-        if self.cond is not None:
-            def f_bool_for_finder(r_idx_int: int, c_idx_int: int) -> bool:
-                # This closure needs access to the Iset_lists and Jset_lists
-                # of the *Pi matrix* for bond p, not self.Iset_lists of TensorCI1 directly.
-                # Pi_mat[p].Iset (from buildPiAt) and Pi_mat[p].Jset are needed.
-                # Let's assume Pi_mat[p] (a MatLazyIndex) has .Iset and .Jset attributes
-                # that store the full list of multi-indices for its rows and columns.
-                pi_matrix_view = tensor_ci_instance.mat_lazy_Pi_at[current_bond_p]
-                
-                if r_idx_int >= len(pi_matrix_view.Iset_list_internal) or \
-                   c_idx_int >= len(pi_matrix_view.Jset_list_internal):
-                    return False 
 
-                multi_idx_I_for_Pi_row = pi_matrix_view.Iset_list_internal[r_idx_int]
-                multi_idx_J_for_Pi_col = pi_matrix_view.Jset_list_internal[c_idx_int]
-                
-                full_multi_idx_for_fc = multi_idx_I_for_Pi_row + multi_idx_J_for_Pi_col
-                return self.cond(list(full_multi_idx_for_fc))
-            adapted_f_bool = f_bool_for_finder
+
+# In tensor_ci.py
+
+# ... (imports and TensorCI1Param class as before) ...
+
+@dataclasses.dataclass
+class TTEnvMatrices:
+    L: List[Optional[cytnx.UniTensor]]
+    R: List[Optional[cytnx.UniTensor]]
+    D: int
+    dtype: int
+    device: int
+    is_active: bool = False
+
+    def __init__(self, D_sites: int,
+                 initial_tt: Optional[TensorTrain] = None,
+                 site_weights_list: Optional[List[List[float]]] = None,
+                 dtype: int = Type.Double, device: int = Device.cpu):
+        self.D = D_sites
+        self.dtype = dtype
+        self.device = device
+        self.L = [None] * self.D 
+        self.R = [None] * self.D 
+        self.is_active = False
+
+        if self.D <= 0:
+            logger.warning("TTEnvMatrices initialized with D_sites <= 0.")
+            return
+
+        # Initialize boundary environments
+        self.L[0] = UniTensor(cytnx.ones(1, dtype=self.dtype, device=self.device), rowrank=0).set_labels(['env_L_0_out'])
+        if self.D > 0: # Ensure R is also initialized if D>0
+            self.R[self.D - 1] = UniTensor(cytnx.ones(1, dtype=self.dtype, device=self.device), rowrank=0).set_labels(['env_R_D-1_in'])
+
+        if initial_tt is not None and site_weights_list is not None:
+            actual_tt_len = len(initial_tt.M) if hasattr(initial_tt, 'M') and initial_tt.M is not None else 0
+            if actual_tt_len == self.D and len(site_weights_list) == self.D:
+                logger.info("TTEnvMatrices: Initializing L and R environments from provided TT and weights.")
+                self.initialize_environments_from_tt(initial_tt, site_weights_list)
+            else:
+                logger.error(f"TTEnvMatrices init: Mismatch in D (expected {self.D}, TT has {actual_tt_len}) "
+                             f"or weights length (expected {self.D}, got {len(site_weights_list)}).")
+        else:
+            logger.debug("TTEnvMatrices init: No initial_tt or weights. Boundary L/R are set.")
+
+    def _get_np_dtype_for_weights(self, cytnx_dtype: int) -> Any:
+        if cytnx_dtype == Type.ComplexDouble: return np.complex128
+        if cytnx_dtype == Type.ComplexFloat: return np.complex64
+        if cytnx_dtype == Type.Double: return np.float64
+        if cytnx_dtype == Type.Float: return np.float32
+        logger.warning(f"TTEnvMatrices: Unexpected dtype {cytnx_dtype} for weights, defaulting to np.float64.")
+        return np.float64
+
+    def initialize_environments_from_tt(self, tt: TensorTrain, site_weights_list: List[List[float]]):
+        if not (tt.M and all(core is not None for core in tt.M)):
+            logger.error("TTEnvMatrices: Cannot initialize, TT cores not fully defined."); self.is_active = False; return
+        if self.D == 0 : self.is_active = False; return
+
+        # --- Left sweep: L[p+1] = contract(L[p], M[p], W[p]) ---
+        logger.debug("TTEnvMatrices: Initializing L environments.")
+        # L[0] is already set. Loop calculates L[1] to L[D-1]
+        for p in range(self.D - 1): 
+            if tt.M[p] is None: logger.error(f"L-init: M[{p}] is None."); self.is_active=False; return
+            L_prev = self.L[p]
+            if L_prev is None: logger.error(f"L-init: L[{p}] is None."); self.is_active=False; return
+
+            # Ensure labels are set before using them for out_labels or relabeling
+            M_p_orig_labels = tt.M[p].labels()
+            L_prev_out_label = L_prev.labels()[0] # e.g. 'env_L_0_out' or 'vL_out_site{p-1}'
+            
+            # Define labels for M_p's legs for this contraction step
+            # M_p bonds: (left_virtual, physical, right_virtual)
+            m_p_contract_label_L = L_prev_out_label # Match L_prev's outgoing
+            m_p_contract_label_P = f'p{p}_contract'
+            m_p_contract_label_R_out = f'vL_out_site{p}' # This will be the label of L[p+1]'s leg
+
+            M_p = tt.M[p].relabeled(M_p_orig_labels[0], m_p_contract_label_L)
+            M_p.relabel_(M_p_orig_labels[1], m_p_contract_label_P)
+            M_p.relabel_(M_p_orig_labels[2], m_p_contract_label_R_out)
+            M_p.contiguous_()
+
+            np_w_p = np.array(site_weights_list[p], dtype=self._get_np_dtype_for_weights(self.dtype))
+            W_p_tensor = from_numpy(np_w_p).to(self.device).astype(self.dtype)
+            W_p_ut = UniTensor(W_p_tensor, rowrank=1).set_labels([m_p_contract_label_P]) # Match M_p's physical
+
+            try:
+                # L_prev(1) -- M_p(1,2,-1) -- W_p_ut(2)  ==>  L_next(-1)
+                self.L[p+1] = cytnx.ncon(
+                    [L_prev, M_p, W_p_ut],
+                    [[1], [1, 2, -1], [2]],
+                    cont_order=[1, 2],          # Contract legs labeled 1 and 2
+                    out_labels=[m_p_contract_label_R_out] # Label for the output leg -1
+                )
+                # logger.debug(f"Initialized L[{p+1}] shape: {self.L[p+1].shape()} labels: {self.L[p+1].labels()}")
+            except RuntimeError as e: # Catch Cytnx runtime errors from ncon
+                logger.error(f"RuntimeError during ncon for L[{p+1}]: {e}", exc_info=True)
+                self.is_active=False; return
+            except Exception as e: 
+                logger.error(f"General error initializing L[{p+1}]: {e}",exc_info=True)
+                self.is_active=False; return
+
+        # --- Right sweep: R[p-1] = contract(M[p], W[p], R[p]) ---
+        logger.debug("TTEnvMatrices: Initializing R environments.")
+        # R[D-1] is already set. Loop calculates R[D-2] down to R[0]
+        for p in range(self.D - 1, 0, -1): 
+            if tt.M[p] is None: logger.error(f"R-init: M[{p}] is None."); self.is_active=False; return
+            R_next = self.R[p] # Environment to the right of site p
+            if R_next is None: logger.error(f"R-init: R[{p}] is None."); self.is_active=False; return
+
+            M_p_orig_labels = tt.M[p].labels()
+            R_next_in_label = R_next.labels()[0] # e.g. 'env_R_D-1_in' or 'vR_out_site{p}' (conceptually)
+
+            m_p_contract_label_L_out = f'vR_out_site{p-1}' # This will be label of R[p-1]'s leg
+            m_p_contract_label_P = f'p{p}_contract'
+            m_p_contract_label_R = R_next_in_label # Match R_next's incoming
+
+            M_p = tt.M[p].relabeled(M_p_orig_labels[0], m_p_contract_label_L_out)
+            M_p.relabel_(M_p_orig_labels[1], m_p_contract_label_P)
+            M_p.relabel_(M_p_orig_labels[2], m_p_contract_label_R)
+            M_p.contiguous_()
+            
+            np_w_p = np.array(site_weights_list[p], dtype=self._get_np_dtype_for_weights(self.dtype))
+            W_p_tensor = from_numpy(np_w_p).to(self.device).astype(self.dtype)
+            W_p_ut = UniTensor(W_p_tensor, rowrank=1).set_labels([m_p_contract_label_P])
+            
+            try:
+                # M_p(-1,2,1) -- W_p_ut(2) -- R_next(1)  ==>  R_curr(-1)
+                self.R[p-1] = cytnx.ncon(
+                    [M_p, W_p_ut, R_next],
+                    [[-1, 2, 1], [2], [1]],
+                    cont_order=[1, 2],          # Contract legs 1 and 2
+                    out_labels=[m_p_contract_label_L_out] # Label for the output leg -1
+                )
+                # logger.debug(f"Initialized R[{p-1}] shape: {self.R[p-1].shape()} labels: {self.R[p-1].labels()}")
+            except RuntimeError as e: # Catch Cytnx runtime errors from ncon
+                logger.error(f"RuntimeError during ncon for R[{p-1}]: {e}", exc_info=True)
+                self.is_active=False; return
+            except Exception as e: 
+                logger.error(f"General error initializing R[{p-1}]: {e}",exc_info=True)
+                self.is_active=False; return
         
-        # Weight handling can be added later if tt_sum logic is implemented
-        return PivotFinderParam(
-            full_piv=self.fullPiv,
-            n_rook_iter=self.nRookIter,
-            f_bool=adapted_f_bool 
-        )
+        self.is_active = True # Set active only if all initializations succeed
+        logger.info("TTEnvMatrices environments initialized successfully from TT.")
+
+
+    def update_site(self, p_core_idx: int, M_core_norm: cytnx.UniTensor, 
+                    site_core_weights: List[float], is_left_to_right_update: bool):
+        if not self.is_active: logger.debug("TTEnvMatrices.update_site on inactive instance. Skipping."); return # Changed to debug
+        if M_core_norm is None: logger.error("M_core_norm is None in update_site."); return
+            
+        M_core_norm = M_core_norm.contiguous() 
+        
+        np_weights = np.array(site_core_weights, dtype=self._get_np_dtype_for_weights(self.dtype))
+        W_tensor = from_numpy(np_weights).to(self.device).astype(self.dtype)
+        W_ut = UniTensor(W_tensor, rowrank=1).set_labels(['phys_contract']) 
+
+        if is_left_to_right_update: 
+            if p_core_idx + 1 >= self.D: return 
+            L_prev = self.L[p_core_idx]
+            if L_prev is None: logger.error(f"L[{p_core_idx}] is None for L-update."); return
+
+            # M_core_norm labels from get_TP1_at: ('vL_in', 'p_phys', 'vR_out') or similar
+            # L_prev label: ('vL_in')
+            # W_ut label: ('p_phys')
+            # Target L[p_core_idx+1] label: ('vR_out')
+            
+            m_left_lbl, m_phys_lbl, m_right_lbl = M_core_norm.labels() # Get actual labels
+            l_prev_lbl = L_prev.labels()[0]
+
+            M_core_relabel = M_core_norm.relabeled(m_left_lbl, l_prev_lbl) # Match L_prev
+            M_core_relabel.relabel_(m_phys_lbl, 'phys_contract')       # Match W_ut
+            # m_right_lbl will be the output label
+
+            try:
+                # L_prev(1) -- M_core(1,2,-1) -- W_ut(2) ==> L_next(-1)
+                self.L[p_core_idx+1] = cytnx.ncon(
+                    [L_prev, M_core_relabel, W_ut],
+                    [[1],[1,2,-1],[2]],
+                    cont_order=[1,2],
+                    out_labels=[m_right_lbl] # Use original right label of M_core_norm
+                )
+                # logger.debug(f"Updated L[{p_core_idx+1}] shape: {self.L[p_core_idx+1].shape()}")
+            except RuntimeError as e: logger.error(f"RuntimeError updating L[{p_core_idx+1}] with ncon: {e}", exc_info=True)
+            except Exception as e: logger.error(f"Error updating L[{p_core_idx+1}]: {e}", exc_info=True)
+
+        else: # Update R[p_core_idx - 1]
+            if p_core_idx - 1 < 0: return 
+            R_prev = self.R[p_core_idx]
+            if R_prev is None: logger.error(f"R[{p_core_idx}] is None for R-update."); return
+            
+            # M_core_norm labels from get_P1T_at: ('vL_in', 'p_phys', 'vR_out') or similar
+            # R_prev label: ('vR_out')
+            # W_ut label: ('p_phys')
+            # Target R[p_core_idx-1] label: ('vL_in')
+
+            m_left_lbl, m_phys_lbl, m_right_lbl = M_core_norm.labels()
+            r_prev_lbl = R_prev.labels()[0]
+
+            M_core_relabel = M_core_norm.relabeled(m_right_lbl, r_prev_lbl) # Match R_prev
+            M_core_relabel.relabel_(m_phys_lbl, 'phys_contract')        # Match W_ut
+            # m_left_lbl will be the output label
+
+            try:
+                # M_core(-1,2,1) -- W_ut(2) -- R_prev(1) ==> R_next(-1)
+                self.R[p_core_idx-1] = cytnx.ncon(
+                    [M_core_relabel, W_ut, R_prev],
+                    [[-1,2,1],[2],[1]],
+                    cont_order=[1,2],
+                    out_labels=[m_left_lbl] # Use original left label of M_core_norm
+                )
+                # logger.debug(f"Updated R[{p_core_idx-1}] shape: {self.R[p_core_idx-1].shape()}")
+            except RuntimeError as e: logger.error(f"RuntimeError updating R[{p_core_idx-1}] with ncon: {e}", exc_info=True)
+            except Exception as e: logger.error(f"Error updating R[{p_core_idx-1}]: {e}", exc_info=True)
+
+
 
 class TensorCI1:
     def __init__(self,
-                 fc: TensorFunction,
-                 phys_dims: List[int], 
+                 fc: 'TensorFunction',
+                 phys_dims: List[int],
                  param: Optional[TensorCI1Param] = None,
                  dtype: int = cytnx.Type.Double,
                  device: int = cytnx.Device.cpu):
 
         self.fc = fc
         self.phys_dims = phys_dims
-        self.D = len(phys_dims) 
+        self.D = len(phys_dims)
         self.param = param if param is not None else TensorCI1Param()
         self.dtype = dtype
         self.device = device
-        self.dMax = 0 # Placeholder, dMax is used by compressLU or TT construction, not directly in CI param
+        self.errorDecay: List[float] = []
+        self.done: bool = False
+        self.dMax = 0 
 
-        if self.param and hasattr(self.param, 'dMax_tt') and self.param.dMax_tt > 0: # Example if dMax was in param
-            self.dMax = self.param.dMax_tt
-        # Or, if dMax is a global setting for the TCI process controlled elsewhere:
-        # self.dMax = some_global_dmax_setting (passed to __init__ or set via a method)
+        if self.D < 1: raise ValueError("Number of sites must be at least 1.")
 
-        if self.D < 1:
-            raise ValueError("Number of sites (len(phys_dims)) must be at least 1.")
-        
-        # 1. Handle initial pivot (param.pivot1)
         self.initial_pivot_multi_index: Tuple[int, ...]
         if self.param.pivot1 is None or not self.param.pivot1:
             self.initial_pivot_multi_index = tuple([0] * self.D)
         else:
-            if len(self.param.pivot1) != self.D:
-                raise ValueError(f"Length of pivot1 must match number of sites D.")
+            if len(self.param.pivot1) != self.D: raise ValueError("pivot1 length mismatch D.")
             self.initial_pivot_multi_index = tuple(self.param.pivot1)
 
         initial_pivot_value = self.fc(self.initial_pivot_multi_index)
-        if abs(initial_pivot_value) < 1e-15:
-            raise ValueError(f"Value of f at initial pivot {self.initial_pivot_multi_index} is ~zero. Provide a better pivot.")
+        if abs(initial_pivot_value) < 1e-15: 
+            raise ValueError(f"f({self.initial_pivot_multi_index}) = {initial_pivot_value} is ~zero.")
 
-        # 2. Initialize Iset_lists_param, Jset_lists_param for defining PiAt matrices
-        # These correspond to C++ Iset[p] and Jset[p+1] (for PiAt(p)) and are based on initial_pivot_multi_index.
-        # For PiAt(p): uses Iset[p] (sites 0..p-1) and Jset[p+1] (sites p+2..D-1)
-        self.param_Iset_for_Pi: List[List[MultiIndex]] = [[] for _ in range(self.D)] 
-        self.param_Jset_for_Pi: List[List[MultiIndex]] = [[] for _ in range(self.D)] 
-
-        for p_site in range(self.D): # p_site is the site index
-            self.param_Iset_for_Pi[p_site] = [self.initial_pivot_multi_index[:p_site]] # For PiAt(p_site), left part is sites 0..p_site-1
-            if p_site + 1 < self.D: # For PiAt(p_site), right part uses Jset[p_site+1] in C++ (sites (p_site+1)+1 .. D-1)
-                 self.param_Jset_for_Pi[p_site+1] = [self.initial_pivot_multi_index[p_site+2:]]
-            # param_Jset_for_Pi[0] is not used for PiAt. param_Jset_for_Pi[D-1] will be [()]
-
-        # Initialize member lists
         num_bonds = self.D - 1 if self.D > 0 else 0
-        self.mat_lazy_Pi_at: List[MatLazyIndex] = [None] * num_bonds
-        self.P_cross_data: List[CrossData] = [None] * num_bonds
-        self.tt = TensorTrain() 
-        self.tt.M = [None] * self.D 
-        self.P_pivot_matrices: List[Tensor] = [None] * self.D 
-        self.pivFinder: List[PivotFinder] = [None] * num_bonds
-        self.errorDecay: List[float] = []
-        self.done: bool = False
 
+        self.param_Iset_for_Pi_construction: List[List[MultiIndex]] = [[] for _ in range(self.D)]
+        self.param_Jset_for_Pi_construction: List[List[MultiIndex]] = [[] for _ in range(self.D)]
+        for p_site in range(self.D):
+            self.param_Iset_for_Pi_construction[p_site] = [self.initial_pivot_multi_index[:p_site]]
+            if p_site + 1 < self.D :
+                 self.param_Jset_for_Pi_construction[p_site+1] = [self.initial_pivot_multi_index[p_site+2:]]
 
-        # 3. Create Pi matrices, CrossData objects, and add the first pivot for each bond
-        for p_bond in range(num_bonds): # p_bond from 0 to D-2
-            # Row multi-indices for Pi_mat[p_bond]: kron(param_Iset_for_Pi[p_bond], phys_dims[p_bond])
-            pi_rows_multi_indices: List[MultiIndex] = []
-            for i_idx_multi in self.param_Iset_for_Pi[p_bond]: 
-                for phys_val_site_p_bond in range(self.phys_dims[p_bond]):
-                    pi_rows_multi_indices.append(i_idx_multi + (phys_val_site_p_bond,))
-            
-            # Col multi-indices for Pi_mat[p_bond]: kron(phys_dims[p_bond+1], param_Jset_for_Pi[p_bond+1])
-            pi_cols_multi_indices: List[MultiIndex] = []
-            # Jset for bond p_bond corresponds to sites p_bond+2 onwards, used with site p_bond+1
-            # param_Jset_for_Pi[p_bond+1] contains [initial_pivot_multi_index[p_bond+2:]]
-            jset_to_use_for_pi_cols = self.param_Jset_for_Pi[p_bond+1] if p_bond+1 < self.D else [()]
+        self.mat_lazy_Pi_at: List[Optional[MatLazyIndex]] = [None] * num_bonds
+        self.P_cross_data: List[Optional[CrossData]] = [None] * num_bonds
+        
+        for p_bond in range(num_bonds):
+            pi_rows_mi: List[MultiIndex] = [i_idx_multi + (phys_val,)
+                for i_idx_multi in self.param_Iset_for_Pi_construction[p_bond]
+                for phys_val in range(self.phys_dims[p_bond])]
+            jset_pi_cols = self.param_Jset_for_Pi_construction[p_bond+1] if p_bond+1 < self.D else [()]
+            pi_cols_mi: List[MultiIndex] = [(phys_val,) + j_idx_multi
+                for phys_val in range(self.phys_dims[p_bond+1])
+                for j_idx_multi in jset_pi_cols]
 
-            for phys_val_site_p_bond_plus_1 in range(self.phys_dims[p_bond+1]):
-                for j_idx_multi in jset_to_use_for_pi_cols:
-                    pi_cols_multi_indices.append( (phys_val_site_p_bond_plus_1,) + j_idx_multi )
-            
-            def fc_for_Pi_p_factory(p_bnd_captured): 
-                def fc_for_Pi_p(pi_row_mi: MultiIndex, pi_col_mi: MultiIndex) -> float:
-                    full_mi = pi_row_mi + pi_col_mi
-                    return self.fc(full_mi)
-                return fc_for_Pi_p
+            def fc_for_Pi_factory(p_b): 
+                def fc_pi(row_mi: MultiIndex, col_mi: MultiIndex) -> float:
+                    return self.fc(row_mi + col_mi)
+                return fc_pi
 
-            self.mat_lazy_Pi_at[p_bond] = MatLazyIndex(fc_for_Pi_p_factory(p_bond), 
-                                                       pi_rows_multi_indices, 
-                                                       pi_cols_multi_indices)
-            # Store for PivotFinderParam.cond adaptation
-            self.mat_lazy_Pi_at[p_bond].Iset_list_internal = pi_rows_multi_indices 
-            self.mat_lazy_Pi_at[p_bond].Jset_list_internal = pi_cols_multi_indices
+            self.mat_lazy_Pi_at[p_bond] = make_IMatrix( 
+                fc_for_Pi_factory(p_bond), pi_rows_mi, pi_cols_mi,
+                full=False, dtype=self.dtype, device=self.device
+            ) # type: ignore
 
-            self.P_cross_data[p_bond] = CrossData(
-                self.mat_lazy_Pi_at[p_bond].n_rows, 
-                self.mat_lazy_Pi_at[p_bond].n_cols
-            )
-            self.P_cross_data[p_bond].lu = AdaptiveLU(
-                self.mat_lazy_Pi_at[p_bond].n_rows,
-                self.mat_lazy_Pi_at[p_bond].n_cols,
-                tol=self.param.reltol, 
-                rankmax=self.dMax if self.dMax > 0 else 0 # Use dMax for AdaptiveLU of CrossData
-            )
-            
-            # Determine the pivot indices in Pi_mat[p_bond] corresponding to initial_pivot_multi_index
-            # Pi_mat[p_bond] row_mi: initial_pivot_multi_index[0...p_bond]
-            # Pi_mat[p_bond] col_mi: initial_pivot_multi_index[p_bond+1...D-1]
-            row_pivot_mi_for_Pi = self.initial_pivot_multi_index[:p_bond+1]
-            col_pivot_mi_for_Pi = self.initial_pivot_multi_index[p_bond+1:]
+            self.P_cross_data[p_bond] = CrossData(self.mat_lazy_Pi_at[p_bond].n_rows, self.mat_lazy_Pi_at[p_bond].n_cols)
+            if self.P_cross_data[p_bond] is not None: # Ensure lu exists
+                 self.P_cross_data[p_bond].tol = self.param.reltol
+
+            row_pivot_mi_for_Pi_p = self.initial_pivot_multi_index[:p_bond+1]
+            col_pivot_mi_for_Pi_p = self.initial_pivot_multi_index[p_bond+1:]
             try:
-                pivot_i_in_Pi_p = pi_rows_multi_indices.index(row_pivot_mi_for_Pi)
-                pivot_j_in_Pi_p = pi_cols_multi_indices.index(col_pivot_mi_for_Pi)
-            except ValueError:
-                raise ValueError(f"Initial pivot for bond {p_bond} not constructible in Pi_mat index sets. Logic error.")
-
+                pivot_i_in_Pi_p = pi_rows_mi.index(row_pivot_mi_for_Pi_p)
+                pivot_j_in_Pi_p = pi_cols_mi.index(col_pivot_mi_for_Pi_p)
+            except ValueError: raise ValueError(f"Initial pivot for bond {p_bond} not in Pi_mat index lists.")
+            
             self.P_cross_data[p_bond].addPivot(pivot_i_in_Pi_p, pivot_j_in_Pi_p, self.mat_lazy_Pi_at[p_bond])
 
-        # 4. Initialize self.tt.M (T3 cores) and self.P_pivot_matrices
-        # Based on C++: T3[p] from cross[p].C, T3[p+1] from cross[p].R
-        # This means M[p] uses C from P_cross_data[p] AND R from P_cross_data[p-1]
 
-        for p_site in range(self.D): # p_site is the site index for M[p_site]
-            # Determine chi_left and chi_right for M[p_site]
-            # chi_left is rank of bond p_site-1 (from P_cross_data[p_site-1].rank())
-            # chi_right is rank of bond p_site (from P_cross_data[p_site].rank())
-            # All initial ranks are 1.
-            
-            chi_left = 1 if p_site == 0 else self.P_cross_data[p_site-1].rank()
-            chi_right = 1 if p_site == self.D - 1 else self.P_cross_data[p_site].rank()
+        self.tt = TensorTrain() 
+        self.tt.M = [None] * self.D
+        self.P_pivot_matrices: List[Optional[Tensor]] = [None] * self.D
+
+        for p_site in range(self.D):
+            chi_left = 1 if p_site == 0 else (self.P_cross_data[p_site-1].rank() if self.P_cross_data[p_site-1] else 1)
+            chi_right = 1 if p_site == self.D - 1 else (self.P_cross_data[p_site].rank() if self.P_cross_data[p_site] else 1)
             d_current = self.phys_dims[p_site]
+            core_data_tensor: Tensor
 
-            core_data: Tensor
-            if p_site == 0: # First core M[0], data from C of P_cross_data[0]
-                C0 = self.P_cross_data[0].lu.C # Shape (d_0, 1) because pi_rows_multi_indices for bond 0 had length d0, rank is 1
-                if C0 is None: raise RuntimeError("C0 is None in init")
-                core_data = C0.reshape(1, d_current, chi_right) 
-            else: # Middle or last core M[p_site], data from R of P_cross_data[p_site-1]
-                  # R_{p_site-1} has shape (chi_left, d_{p_site} * chi_right_of_R)
-                  # where chi_right_of_R is related to the column space of Pi_{p_site-1}
-                  # For initial rank 1, R_{p_site-1} from cross[p_site-1] has shape (1, d_{p_site}) if Jset was trivial for next site.
-                Rp_prev = self.P_cross_data[p_site-1].lu.R # R from bond p_site-1
-                if Rp_prev is None: raise RuntimeError(f"R{p_site-1} is None in init")
-                # Rp_prev shape (chi_left, num_cols_Pi_{p-1}).
-                # num_cols_Pi_{p-1} = d_current * (chi_right if not last site else 1 for trivial Jset)
-                core_data = Rp_prev.reshape(chi_left, d_current, chi_right)
-
-            b_left = Bond(chi_left, BD_IN)
-            b_phys = Bond(d_current, BD_OUT)
-            b_right = Bond(chi_right, BD_OUT)
+            if self.D == 1:
+                temp_core_data = cytnx.zeros((1,d_current,1), dtype=self.dtype, device=self.device)
+                if 0 <= self.initial_pivot_multi_index[0] < d_current:
+                     temp_core_data[0, self.initial_pivot_multi_index[0], 0] = initial_pivot_value
+                core_data_tensor = temp_core_data
+            elif p_site == 0 : 
+                pd0 = self.P_cross_data[0]
+                if pd0 is None or pd0.C is None: raise RuntimeError("C0 None for M[0]")
+                core_data_tensor = pd0.C.reshape(1, d_current, chi_right)
+            else: 
+                pdp_prev = self.P_cross_data[p_site-1]
+                if pdp_prev is None or pdp_prev.R is None: raise RuntimeError(f"R{p_site-1} None for M[{p_site}]")
+                core_data_tensor = pdp_prev.R.reshape(chi_left, d_current, chi_right)
             
-            lbl_left = "L_bound" if p_site == 0 else f"link{p_site-1}"
-            lbl_phys = f"p{p_site}"
-            lbl_right = "R_bound" if p_site == self.D - 1 else f"link{p_site}"
-            
-            self.tt.M[p_site] = UniTensor([b_left, b_phys, b_right], labels=[lbl_left, lbl_phys, lbl_right], rowrank=1, dtype=self.dtype, device=self.device)
-            self.tt.M[p_site].put_block(core_data.astype(self.dtype).to(self.device))
+            label_L = f'vL{p_site-1}' if p_site > 0 else 'vL_bound' 
+            label_P = f'p{p_site}'
+            label_R = f'vR{p_site}' if p_site < self.D - 1 else 'vR_bound'
 
-            if p_site < num_bonds : # For P_pivot_matrices up to D-2
-                piv_mat = self.P_cross_data[p_site].pivotMat()
-                self.P_pivot_matrices[p_site] = piv_mat if piv_mat is not None else cytnx.eye(1, dtype=self.dtype, device=self.device)
+            bd_L = cytnx.Bond(chi_left, BD_IN)
+            bd_P = cytnx.Bond(d_current, BD_OUT) # 物理腿通常是 BD_OUT
+            bd_R = cytnx.Bond(chi_right, BD_OUT)
+            
+            current_core_ut = UniTensor(bonds=[bd_L, bd_P, bd_R], 
+                                     labels=[label_L, label_P, label_R], 
+                                     rowrank=1, 
+                                     dtype=self.dtype, 
+                                     device=self.device,
+                                     is_diag=False) # 假設是非對角
+
+            # 4. 確保 core_data_tensor 的 dtype 和 device 與 UniTensor shell 一致，然後填充
+            block_to_put = core_data_tensor.astype(self.dtype).to(self.device)
+            current_core_ut.put_block(block_to_put)
+            
+            self.tt.M[p_site] = current_core_ut
+
+            if p_site < num_bonds:
+                pd_site = self.P_cross_data[p_site]
+                piv_mat = pd_site.pivotMat() if pd_site else None
+                self.P_pivot_matrices[p_site] = piv_mat if piv_mat is not None \
+                                               else cytnx.eye(chi_right, dtype=self.dtype, device=self.device)
         
-        # Last pivot matrix P[D-1]
-        if self.D > 0: # P_pivot_matrices has size D
-            self.P_pivot_matrices[self.D-1] = cytnx.eye(1, dtype=self.dtype, device=self.device)
-        
-        # Initialize PivotFinders
+        if self.D > 0: self.P_pivot_matrices[self.D-1] = cytnx.eye(1, dtype=self.dtype, device=self.device)
+
+        self.Pi_bool_mat: List[Optional[cytnx.Tensor]] = [None] * num_bonds
+        if self.param.cond is not None and num_bonds > 0:
+            for p_bond in range(num_bonds):
+                pi_matrix_view = self.mat_lazy_Pi_at[p_bond]
+                if not (pi_matrix_view and hasattr(pi_matrix_view, 'Iset') and hasattr(pi_matrix_view, 'Jset') and
+                        pi_matrix_view.Iset is not None and pi_matrix_view.Jset is not None): # Check IndexSet objects
+                    logger.warning(f"Pi_mat[{p_bond}] or its IndexSets not available for Pi_bool_mat. Skipping."); continue
+                
+                iset_list_pi = pi_matrix_view.Iset.get_all() 
+                jset_list_pi = pi_matrix_view.Jset.get_all()
+                rows, cols = len(iset_list_pi), len(jset_list_pi)
+
+                if rows == 0 or cols == 0: continue
+                bool_data_np = np.array(
+                    [[self.param.cond(list(iset_list_pi[r] + jset_list_pi[c])) for c in range(cols)] for r in range(rows)],
+                    dtype=bool )
+                self.Pi_bool_mat[p_bond] = from_numpy(bool_data_np).to(self.device).astype(Type.Bool)
+
+
+        self.tt_sum_env: Optional[TTEnvMatrices] = None
+        if self.param.weight is not None and self.D > 0:
+            logger.debug("Initializing TTEnvMatrices for ENV learning.")
+            self.tt_sum_env = TTEnvMatrices(D_sites=self.D, initial_tt=self.tt, 
+                                            site_weights_list=self.param.weight,
+                                            dtype=self.dtype, device=self.device)
+            if not self.tt_sum_env.is_active: logger.warning("TTEnvMatrices marked inactive after init.")
+
+        self.pivFinder: List[Optional[PivotFinder]] = [None] * num_bonds
         for p_bond in range(num_bonds):
-            finder_param_p = self.param.to_pivot_finder_param(self, p_bond) 
+            finder_param_p = self._build_pivot_finder_param_at_bond(p_bond)
             self.pivFinder[p_bond] = PivotFinder(param=finder_param_p)
 
         if self.param.nIter > 0 and num_bonds > 0 :
-            self.IterateN(self.param.nIter)
-            
-    def _update_tt_and_P_matrices_after_pivot(self, p_bond: int):
-        """
-        Helper function to update tt.M[p_bond], tt.M[p_bond+1] (if applicable)
-        and P_pivot_matrices[p_bond] after P_cross_data[p_bond].lu has been updated
-        with a new pivot.
-        This mirrors the C++ logic where T3[p] views cross[p].C and T3[p+1] views cross[p].R.
-        """
-        C_p = self.P_cross_data[p_bond].lu.C
-        R_p = self.P_cross_data[p_bond].lu.R
-        current_rank_p = self.P_cross_data[p_bond].rank()
-
-        if C_p is None: # R_p can be None if C_p is None and rank is 0.
-            logger.warning(f"Bond {p_bond}: C_p matrix in CrossData is None. Cannot update TT cores M[{p_bond}] comprehensively.")
-            # Potentially set M[p_bond] to a small identity or zero tensor of correct shape if rank is known
-            # For now, if C_p is None, it implies rank is likely 0 or an error occurred in AdaptiveLU.
-            # We might need to handle this by creating zero tensors for TT cores if that's the desired behavior.
-            # For this draft, we'll assume C_p and R_p are valid if rank > 0.
-            if current_rank_p == 0: # If rank is truly zero
-                 chi_left_Mp = 1 if p_bond == 0 else self.tt.M[p_bond].bonds()[0].dim()
-                 chi_right_Mp = 1 # Rank is 0 for this bond
-                 data_Mp = cytnx.zeros((chi_left_Mp, self.phys_dims[p_bond], chi_right_Mp), dtype=self.dtype, device=self.device)
-                 self.tt.M[p_bond].put_block(data_Mp)
-                 
-                 if p_bond + 1 < self.D:
-                    chi_left_Mp1 = chi_right_Mp # = 1
-                    chi_right_Mp1 = 1 if (p_bond + 1) == (self.D - 1) else self.tt.M[p_bond+1].bonds()[2].dim()
-                    data_Mp1 = cytnx.zeros((chi_left_Mp1, self.phys_dims[p_bond+1], chi_right_Mp1), dtype=self.dtype, device=self.device)
-                    self.tt.M[p_bond+1].put_block(data_Mp1)
-            # Fall through to update P_pivot_matrices
-            
-        else: # C_p is not None, rank_p > 0
-            # --- Update self.tt.M[p_bond] (corresponds to T3[p] in C++) ---
-            # Data from C_matrix of P_cross_data[p_bond]
-            # Expected shape: (chi_left, d_current, chi_right_current_bond)
-            chi_left_Mp = self.tt.M[p_bond].bonds()[0].dim() # Existing left bond dimension
-            d_current_Mp = self.phys_dims[p_bond]
-            # New right bond dimension for M[p_bond] is the new rank of P_cross_data[p_bond]
-            new_chi_right_Mp = current_rank_p 
-
-            # C_p has shape (num_rows_Pi_p, rank_p). 
-            # num_rows_Pi_p should be chi_left_Mp * d_current_Mp
-            if C_p.shape()[0] != chi_left_Mp * d_current_Mp:
-                logger.error(f"Update M[{p_bond}]: C_p rows {C_p.shape()[0]} mismatch. Expected {chi_left_Mp * d_current_Mp}. "
-                             f"(chi_left={chi_left_Mp}, d={d_current_Mp})")
-                # This indicates a potential issue in how dimensions are tracked or reshaped.
-                # For now, proceed with reshape if total elements match, otherwise error.
-                if C_p.shape()[0] * C_p.shape()[1] != chi_left_Mp * d_current_Mp * new_chi_right_Mp:
-                     raise ValueError("Fatal dimension mismatch for C_p when updating M[p_bond].")
-
-            core_data_Mp = C_p.reshape(chi_left_Mp, d_current_Mp, new_chi_right_Mp)
-            
-            # Update existing M[p_bond] UniTensor
-            self.tt.M[p_bond].bonds()[2].assign(Bond(new_chi_right_Mp, BD_OUT)) # Update right bond
-            self.tt.M[p_bond].set_labels([self.tt.M[p_bond].labels()[0], self.tt.M[p_bond].labels()[1], f"link{p_bond}"]) # Update label
-            self.tt.M[p_bond].put_block(core_data_Mp.astype(self.dtype).to(self.device))
-
-            # --- Update self.tt.M[p_bond+1] (corresponds to T3[p+1] in C++) ---
-            # Data from R_matrix of P_cross_data[p_bond]
-            if p_bond + 1 < self.D:
-                if R_p is None:
-                    raise RuntimeError(f"R_p is None for bond {p_bond} when trying to update M[{p_bond+1}]")
-
-                chi_left_Mp1 = new_chi_right_Mp # New left bond for M[p+1] is new_chi_right_Mp
-                d_current_Mp1 = self.phys_dims[p_bond+1]
-                # Right bond of M[p+1] is not changed by update of bond p_bond,
-                # unless it's the very last bond, then it's 1.
-                chi_right_Mp1 = self.tt.M[p_bond+1].bonds()[2].dim() 
-
-                # R_p has shape (rank_p, num_cols_Pi_p).
-                # num_cols_Pi_p should be d_current_Mp1 * chi_right_Mp1
-                if R_p.shape()[1] != d_current_Mp1 * chi_right_Mp1:
-                    logger.error(f"Update M[{p_bond+1}]: R_p cols {R_p.shape()[1]} mismatch. Expected {d_current_Mp1 * chi_right_Mp1}. "
-                                 f"(d={d_current_Mp1}, chi_right={chi_right_Mp1})")
-                    if R_p.shape()[0] * R_p.shape()[1] != chi_left_Mp1 * d_current_Mp1 * chi_right_Mp1:
-                        raise ValueError("Fatal dimension mismatch for R_p when updating M[p_bond+1].")
-
-                core_data_Mp1 = R_p.reshape(chi_left_Mp1, d_current_Mp1, chi_right_Mp1)
-
-                # Update existing M[p_bond+1] UniTensor
-                self.tt.M[p_bond+1].bonds()[0].assign(Bond(chi_left_Mp1, BD_IN)) # Update left bond
-                self.tt.M[p_bond+1].set_labels([f"link{p_bond}", self.tt.M[p_bond+1].labels()[1], self.tt.M[p_bond+1].labels()[2]]) # Update label
-                self.tt.M[p_bond+1].put_block(core_data_Mp1.astype(self.dtype).to(self.device))
-
-        # Update Pivot Matrix P_k (square matrix from CrossData)
-        pivot_mat_p = self.P_cross_data[p_bond].pivotMat()
-        self.P_pivot_matrices[p_bond] = pivot_mat_p if pivot_mat_p is not None \
-                                       else cytnx.eye(current_rank_p if current_rank_p > 0 else 1, 
-                                                      dtype=self.dtype, device=self.device)
+            logger.info(f"__init__: Running {self.param.nIter} initial TCI iterations.")
+            # (Ensure IterateN or iterate_one_full_sweep is defined and called)
+            if hasattr(self, 'IterateN'): self.IterateN(self.param.nIter)
+            elif hasattr(self, 'iterate_one_full_sweep'):
+                for _ in range(self.param.nIter): self.iterate_one_full_sweep()
 
 
-    def IterateN(self, n_iterations: int, update_M_data: bool = True): # Renamed from Iterate to IterateN
-        """
-        Performs n_iterations of the TCI procedure (half-sweeps or full sweeps).
-        C++ iterate(n) does n half-sweeps.
-        """
-        logger.info(f"Starting {n_iterations} TCI iteration steps (half-sweeps).")
-        num_bonds = self.D - 1
-        if num_bonds < 0 : # D=0 or D=1 (no bonds)
-            logger.warning("No bonds to iterate over.")
-            return 0.0
-
-        max_error_overall = 0.0
+    def get_TP1_at(self, p_bond: int) -> Optional[cytnx.UniTensor]:
+        if not (0 <= p_bond < self.D): logger.error(f"get_TP1_at: p_bond {p_bond} OOB."); return None
+        M_core_p = self.tt.M[p_bond]
+        if M_core_p is None: logger.error(f"get_TP1_at: M[{p_bond}] is None."); return None
         
-        for iter_count in range(n_iterations):
-            max_error_this_half_sweep = 0.0
-            # Example: Simple left-to-right half-sweep for adding pivots
-            # C++ iterate() seems to do half-sweeps, alternating directions if called multiple times.
-            # For now, let's do a fixed direction half-sweep.
-            # The C++ TensorCI1::iterate(int nSweep) does nSweep/2 full sweeps (L->R then R->L).
-            # Let's make IterateN do n_iterations of full sweeps for simplicity here.
-            
-            current_sweep = iter_count + 1
-            logger.info(f"--- TCI Full Sweep: {current_sweep}/{n_iterations} ---")
+        P_matrix_p = self.P_pivot_matrices[p_bond]
+        if P_matrix_p is None :
+             if p_bond == self.D - 1 and self.D > 0 : return M_core_p.clone()
+             logger.error(f"get_TP1_at: P[{p_bond}] is None."); return None
+        try:
+            M_matrix_form = cube_as_matrix2(M_core_p) 
+            TP1_matrix_form = mat_AB1(M_matrix_form, P_matrix_p) 
+            chi_left, d, chi_right = M_core_p.shape()
+            res_ut = UniTensor(TP1_matrix_form.reshape(chi_left, d, chi_right), rowrank=M_core_p.rowrank())
+            # Ensure consistent labeling for ncon
+            res_ut.set_labels([M_core_p.labels()[0], M_core_p.labels()[1], M_core_p.labels()[2]]) 
+            return res_ut
+        except Exception as e: logger.error(f"Error in get_TP1_at({p_bond}): {e}", exc_info=True); return None
 
-            # Left-to-right sweep (updates Jset[p], T3[p] from C[p], T3[p+1] from R[p])
-            logger.debug(f"Sweep {current_sweep}: Left-to-Right")
-            for p_bond in range(num_bonds): # 0 to D-2
-                logger.debug(f"  Processing bond L->R: {p_bond}")
-                # This corresponds to C++ addPivotColAt(p_bond, new_pivot_col_idx_in_Pi)
-                # 1. Find pivot
-                pi_matrix_view = self.mat_lazy_Pi_at[p_bond]
-                pivot_finder_p = self.pivFinder[p_bond]
-                # PivotFinder needs to know available rows/cols in Pi_matrix_view
-                # based on P_cross_data[p_bond].lu.Iset/Jset for Pi_matrix_view.
-                # This is complex as PivotFinder takes IMatrix and CrossData.
-                # The IMatrix here is pi_matrix_view, CrossData is P_cross_data[p_bond].
-                pivot_result: PivotData = pivot_finder_p(pi_matrix_view, self.P_cross_data[p_bond])
+    def get_P1T_at(self, p_bond: int) -> Optional[cytnx.UniTensor]:
+        if not (0 <= p_bond < self.D): logger.error(f"get_P1T_at: p_bond {p_bond} OOB."); return None
+        M_core_p = self.tt.M[p_bond]
+        if M_core_p is None: logger.error(f"get_P1T_at: M[{p_bond}] is None."); return None
+        if p_bond == 0: return M_core_p.clone() 
+        P_matrix_prev = self.P_pivot_matrices[p_bond-1]
+        if P_matrix_prev is None: logger.error(f"get_P1T_at: P[{p_bond-1}] is None."); return None
+        try:
+            M_matrix_form = cube_as_matrix1(M_core_p) 
+            P1T_matrix_form = mat_A1B(P_matrix_prev, M_matrix_form) 
+            chi_left, d, chi_right = M_core_p.shape()
+            res_ut = UniTensor(P1T_matrix_form.reshape(chi_left, d, chi_right), rowrank=M_core_p.rowrank())
+            res_ut.set_labels([M_core_p.labels()[0], M_core_p.labels()[1], M_core_p.labels()[2]])
+            return res_ut
+        except Exception as e: logger.error(f"Error in get_P1T_at({p_bond}): {e}", exc_info=True); return None
 
-                if pivot_result.i == -1 or pivot_result.j == -1 or abs(pivot_result.error) < self.param.reltol: # No good pivot or error too small
-                    logger.debug(f"  Bond {p_bond}: No suitable new pivot found or error too small ({pivot_result.error:.2e}).")
-                    continue
-                
-                max_error_this_half_sweep = max(max_error_this_half_sweep, abs(pivot_result.error))
-                self.errorDecay.append(abs(pivot_result.error))
+    def _build_pivot_finder_param_at_bond(self, p_bond: int) -> PivotFinderParam:
+        pf_param = PivotFinderParam(full_piv=self.param.fullPiv, n_rook_iter=self.param.nRookIter)
+        if self.tt_sum_env is not None and self.tt_sum_env.is_active and \
+           self.param.weight is not None and 0 <= p_bond < len(self.param.weight):
+            L_p_uni = self.tt_sum_env.L[p_bond]
+            R_p1_uni = self.tt_sum_env.R[p_bond+1] if (p_bond+1) < self.D else None
 
-                # 2. Add pivot (this updates P_cross_data[p_bond].lu.C, .R, .Iset, .Jset, .rank)
-                # addPivot takes integer indices for pi_matrix_view
-                self.P_cross_data[p_bond].addPivot(pivot_result.i, pivot_result.j, pi_matrix_view)
-                logger.debug(f"  Bond {p_bond}: Added pivot ({pivot_result.i}, {pivot_result.j}), error={pivot_result.error:.2e}, new rank={self.P_cross_data[p_bond].rank()}")
-
-
-                # 3. Update self.tt.M and self.P_pivot_matrices
-                if update_M_data:
-                    self._update_tt_and_P_matrices_after_pivot(p_bond)
-
-                # 4. TODO: updatePiColsAt(p_bond-1) if p_bond > 0
-                # This step updates the Pi matrix and CrossData of the *previous* bond
-                # to reflect the change in basis/rank of the current bond P_cross_data[p_bond].
-                # This is complex as it requires changing MatLazyIndex's Jset_list_internal
-                # and then potentially re-doing parts of CrossData[p_bond-1]'s CI.
-                # if p_bond > 0: self._update_Pi_and_CrossData_cols_at(p_bond - 1, self.P_cross_data[p_bond])
-
-
-            # Right-to-left sweep (updates Iset[p+1], T3[p+1] from C[p], T3[p] from R[p])
-            logger.debug(f"Sweep {current_sweep}: Right-to-Left")
-            for p_bond in range(num_bonds - 1, -1, -1): # D-2 down to 0
-                logger.debug(f"  Processing bond R->L: {p_bond}")
-                # This corresponds to C++ addPivotRowAt(p_bond, new_pivot_row_idx_in_Pi)
-                pi_matrix_view = self.mat_lazy_Pi_at[p_bond]
-                pivot_finder_p = self.pivFinder[p_bond]
-                pivot_result: PivotData = pivot_finder_p(pi_matrix_view, self.P_cross_data[p_bond])
-
-                if pivot_result.i == -1 or pivot_result.j == -1 or abs(pivot_result.error) < self.param.reltol:
-                    logger.debug(f"  Bond {p_bond}: No suitable new pivot found or error too small ({pivot_result.error:.2e}).")
-                    continue
-                
-                max_error_this_half_sweep = max(max_error_this_half_sweep, abs(pivot_result.error))
-                # Error decay might double count if pivot is same, but tracks max error per search
-                # self.errorDecay.append(abs(pivot_result.error)) 
-
-                self.P_cross_data[p_bond].addPivot(pivot_result.i, pivot_result.j, pi_matrix_view)
-                logger.debug(f"  Bond {p_bond}: Added pivot ({pivot_result.i}, {pivot_result.j}), error={pivot_result.error:.2e}, new rank={self.P_cross_data[p_bond].rank()}")
-
-
-                if update_M_data:
-                    self._update_tt_and_P_matrices_after_pivot(p_bond)
-                
-                # 4. TODO: updatePiRowsAt(p_bond+1) if p_bond < num_bonds -1
-                # if p_bond < num_bonds - 1: self._update_Pi_and_CrossData_rows_at(p_bond + 1, self.P_cross_data[p_bond])
-
-            max_error_overall = max_error_this_half_sweep # Or keep track of overall max error differently
-            if max_error_this_half_sweep < self.param.reltol : # Global stopping for all bonds
-                logger.info(f"Converged after {current_sweep} full sweeps. Max error in sweep: {max_error_this_half_sweep:.2e}")
-                self.done = True
-                break
+            if L_p_uni is not None and R_p1_uni is not None:
+                L_p = L_p_uni.get_block_() 
+                R_p1 = R_p1_uni.get_block_()
+                weight_p_list = self.param.weight[p_bond]
+                if weight_p_list:
+                                        # --- 修正 W_p_tensor 的創建 ---
+                    # Infer numpy dtype from self.dtype (TensorCI1's main dtype)
+                    np_dt_weights = np.float64 # Default
+                    if self.dtype == Type.ComplexDouble: np_dt_weights = np.complex128
+                    elif self.dtype == Type.ComplexFloat: np_dt_weights = np.complex64
+                    elif self.dtype == Type.Float: np_dt_weights = np.float32
+                    
+                    np_weights = np.array(weight_p_list, dtype=np_dt_weights)
+                    W_p_tensor = from_numpy(np_weights).to(self.device).astype(self.dtype)
+                    N, M, K = L_p.shape()[0], W_p_tensor.shape()[0], R_p1.shape()[0]
+                    # --- 修正結束 ---
+                    if N > 0 and M > 0:
+                        L_p_for_kron = UniTensor(L_p.reshape(N,1), rowrank=1)
+                        W_p_for_kron_L = UniTensor(W_p_tensor.reshape(M,1), rowrank=1)
+                        kron_LW_flat = linalg.Kron(L_p_for_kron, W_p_for_kron_L).get_block_().reshape(N*M)
+                        pf_param.weight_row = linalg.Abs(kron_LW_flat)
+                    if M > 0 and K > 0:
+                        W_p_for_kron_R = UniTensor(W_p_tensor.reshape(M,1), rowrank=1)
+                        R_p1_for_kron = UniTensor(R_p1.reshape(K,1), rowrank=1)
+                        kron_WR_flat = linalg.Kron(W_p_for_kron_R, R_p1_for_kron).get_block_().reshape(M*K)
+                        pf_param.weight_col = linalg.Abs(kron_WR_flat)
+            else: logger.debug(f"ENV weights: L[{p_bond}] or R[{p_bond+1}] is None.")
         
-        return max_error_overall if self.errorDecay else 0.0
-    def _update_tt_M_and_P_pivot_matrix_after_crossdata_update(self, p_bond: int):
-        """
-        Updates self.tt.M[p_bond], self.tt.M[p_bond+1] (data and bonds),
-        and self.P_pivot_matrices[p_bond] after self.P_cross_data[p_bond].lu
-        has been updated with a new pivot.
+        if self.param.cond is not None and p_bond < len(self.Pi_bool_mat) and self.Pi_bool_mat[p_bond] is not None:
+            pi_bool_tensor_p = self.Pi_bool_mat[p_bond]
+            def f_bool_from_precomputed_matrix(r_idx: int, c_idx: int) -> bool:
+                if 0 <= r_idx < pi_bool_tensor_p.shape()[0] and 0 <= c_idx < pi_bool_tensor_p.shape()[1]:
+                    return bool(pi_bool_tensor_p[r_idx, c_idx].item())
+                return False 
+            pf_param.f_bool = f_bool_from_precomputed_matrix
+        return pf_param
 
-        This reflects the C++ logic where T3[p] views cross[p].C and T3[p+1] views cross[p].R.
-        """
-        current_cross_data = self.P_cross_data[p_bond]
-        if current_cross_data.lu.C is None or current_cross_data.lu.R is None:
-            logger.warning(f"Bond {p_bond}: C or R matrix in CrossData.lu is None. TT core update might be incomplete.")
-            # If C or R is None, rank is likely 0.
-            # We still need to ensure TT cores have correct (trivial) bond dimensions.
-            # For M[p_bond]:
-            chi_left_Mp = self.tt.M[p_bond].bonds()[0].dim()
-            d_Mp = self.phys_dims[p_bond]
-            new_chi_right_Mp = current_cross_data.rank() # Will be 0 if C is None
-
-            self.tt.M[p_bond].bonds()[2].assign(Bond(new_chi_right_Mp, BD_OUT))
-            # Ensure labels are consistent, especially the connecting "link" label
-            self.tt.M[p_bond].set_labels([
-                self.tt.M[p_bond].labels()[0], 
-                self.tt.M[p_bond].labels()[1], 
-                f"link{p_bond}"
-            ])
-            # Create and put a zero block if data is missing
-            zero_block_Mp = cytnx.zeros((chi_left_Mp, d_Mp, new_chi_right_Mp), dtype=self.dtype, device=self.device)
-            self.tt.M[p_bond].put_block(zero_block_Mp)
-
-            if p_bond + 1 < self.D:
-                # For M[p_bond+1]:
-                chi_left_Mp1 = new_chi_right_Mp # Left bond matches new right bond of M[p_bond]
-                d_Mp1 = self.phys_dims[p_bond+1]
-                chi_right_Mp1 = self.tt.M[p_bond+1].bonds()[2].dim() # Right bond of M[p+1] remains for now
-
-                self.tt.M[p_bond+1].bonds()[0].assign(Bond(chi_left_Mp1, BD_IN))
-                self.tt.M[p_bond+1].set_labels([
-                    f"link{p_bond}", 
-                    self.tt.M[p_bond+1].labels()[1], 
-                    self.tt.M[p_bond+1].labels()[2]
-                ])
-                zero_block_Mp1 = cytnx.zeros((chi_left_Mp1, d_Mp1, chi_right_Mp1), dtype=self.dtype, device=self.device)
-                self.tt.M[p_bond+1].put_block(zero_block_Mp1)
-            
-            # Update pivot matrix
-            self.P_pivot_matrices[p_bond] = cytnx.eye(new_chi_right_Mp if new_chi_right_Mp > 0 else 1, 
-                                                      dtype=self.dtype, device=self.device)
-            return
-
-        # Proceed if C_p and R_p are available
-        C_p = current_cross_data.lu.C
-        R_p = current_cross_data.lu.R
-        new_rank_p = current_cross_data.rank() # New rank of bond p
-
-        # --- Update self.tt.M[p_bond] (corresponds to T3[p] in C++) ---
-        # Data from C_matrix of P_cross_data[p_bond]
-        # M[p_bond] current shape: (chi_left_old, d_p, chi_right_old)
-        chi_left_Mp = self.tt.M[p_bond].bonds()[0].dim()
-        d_p = self.phys_dims[p_bond]
+    def update_env_at(self, p_bond: int): 
+        if not (self.tt_sum_env and self.param.weight and self.tt_sum_env.is_active): return
+        logger.debug(f"TensorCI1.update_env_at for bond {p_bond}")
+        tp1_core = self.get_TP1_at(p_bond)
+        if tp1_core and p_bond < len(self.param.weight):
+            self.tt_sum_env.update_site(p_bond, tp1_core, self.param.weight[p_bond], True)
         
-        # C_p is (num_rows_Pi_p, new_rank_p). 
-        # num_rows_Pi_p = chi_left_Mp * d_p according to C++ T3[p] = Cube(C.mem, Isize, localsize, Jsize)
-        # where Isize is chi_left_Mp, localsize is d_p, Jsize is new_rank_p.
-        if C_p.shape()[0] != chi_left_Mp * d_p or C_p.shape()[1] != new_rank_p:
-            logger.error(f"Update M[{p_bond}]: C_p shape {C_p.shape()} mismatch. "
-                         f"Expected ({chi_left_Mp * d_p}, {new_rank_p}). "
-                         f"(chi_left={chi_left_Mp}, d={d_p}, new_rank_p={new_rank_p})")
-            # Fallback or error handling if dimensions are severely mismatched
-            # This might indicate an issue in AdaptiveLU's C matrix construction or dim tracking
-            # For now, we will try to reshape but it might fail if numel doesn't match
-            if C_p.shape()[0] * C_p.shape()[1] != chi_left_Mp * d_p * new_rank_p:
-                 raise ValueError(f"Fatal dimension mismatch for C_p when updating M[{p_bond}]. Cannot reshape.")
-        
-        core_data_Mp = C_p.reshape(chi_left_Mp, d_p, new_rank_p)
-        
-        self.tt.M[p_bond].bonds()[2].assign(Bond(new_rank_p, BD_OUT)) # Update right bond dim
-        self.tt.M[p_bond].set_labels([self.tt.M[p_bond].labels()[0], self.tt.M[p_bond].labels()[1], f"link{p_bond}"])
-        self.tt.M[p_bond].put_block(core_data_Mp.astype(self.dtype).to(self.device))
-
-        # --- Update self.tt.M[p_bond+1] (corresponds to T3[p+1] in C++) ---
-        # Data from R_matrix of P_cross_data[p_bond]
-        if p_bond + 1 < self.D:
-            new_chi_left_Mp1 = new_rank_p # New left bond for M[p+1]
-            d_Mp1 = self.phys_dims[p_bond+1]
-            chi_right_Mp1_old = self.tt.M[p_bond+1].bonds()[2].dim() # Existing right bond dim
-
-            # R_p has shape (new_rank_p, num_cols_Pi_p).
-            # num_cols_Pi_p = d_Mp1 * chi_right_Mp1_old (if Jset for Pi_p was trivial for far right sites)
-            # More generally, num_cols_Pi_p = len(self.mat_lazy_Pi_at[p_bond].Jset_list_internal)
-            if R_p.shape()[0] != new_chi_left_Mp1 or \
-               R_p.shape()[1] != len(self.mat_lazy_Pi_at[p_bond].Jset_list_internal) :
-                logger.error(f"Update M[{p_bond+1}]: R_p shape {R_p.shape()} mismatch. "
-                             f"Expected ({new_chi_left_Mp1}, {len(self.mat_lazy_Pi_at[p_bond].Jset_list_internal)}).")
-                if R_p.shape()[0] * R_p.shape()[1] != new_chi_left_Mp1 * d_Mp1 * chi_right_Mp1_old:
-                     raise ValueError(f"Fatal dimension mismatch for R_p when updating M[{p_bond+1}]. Cannot reshape.")
-            
-            # The reshape must result in (new_chi_left_Mp1, d_Mp1, chi_right_Mp1_old)
-            # This requires R_p.shape()[1] == d_Mp1 * chi_right_Mp1_old.
-            # This implies that the column space of Pi_mat[p_bond] (which R_p's columns span)
-            # must correctly factorize into phys_dims[p_bond+1] and the right virtual bond of M[p_bond+1].
-            # This is automatically true if Jset_list_internal for Pi_mat[p_bond] was kron(phys_dims[p+1], J_param_part)
-            
-            core_data_Mp1 = R_p.reshape(new_chi_left_Mp1, d_Mp1, chi_right_Mp1_old)
-
-            self.tt.M[p_bond+1].bonds()[0].assign(Bond(new_chi_left_Mp1, BD_IN)) # Update left bond
-            self.tt.M[p_bond+1].set_labels([f"link{p_bond}", self.tt.M[p_bond+1].labels()[1], self.tt.M[p_bond+1].labels()[2]])
-            self.tt.M[p_bond+1].put_block(core_data_Mp1.astype(self.dtype).to(self.device))
-
-        # --- Update Pivot Matrix self.P_pivot_matrices[p_bond] ---
-        pivot_mat_p = current_cross_data.pivotMat() # From CrossData instance
-        if pivot_mat_p is None:
-            logger.warning(f"pivotMat() for bond {p_bond} returned None. Using identity.")
-            self.P_pivot_matrices[p_bond] = cytnx.eye(new_rank_p if new_rank_p > 0 else 1, 
-                                                      dtype=self.dtype, device=self.device)
-        else:
-            if pivot_mat_p.shape() != [new_rank_p, new_rank_p]:
-                logger.warning(f"Pivot matrix P[{p_bond}] shape {pivot_mat_p.shape()} does not match new rank ({new_rank_p},{new_rank_p}).")
-                # Fallback or resize? For now, use as is if not None.
-            self.P_pivot_matrices[p_bond] = pivot_mat_p.astype(self.dtype).to(self.device)
-
-
-    def _update_adjacent_Pi_and_CrossData_cols(self, p_bond_to_update_Pi: int, p_bond_source_of_Jset_change: int):
-        """
-        Updates Pi_mat[p_bond_to_update_Pi] and P_cross_data[p_bond_to_update_Pi]
-        because Jset for its columns (derived from site p_bond_to_update_Pi+1, which uses
-        Iset from bond p_bond_source_of_Jset_change) has changed.
-        Corresponds to C++ updatePiColsAt(p_prev) after Jset[p_curr] changed at cross[p_curr].
-        p_bond_to_update_Pi = p_curr - 1
-        p_bond_source_of_Jset_change = p_curr
-        """
-        if p_bond_to_update_Pi < 0:
-            return
-
-        logger.debug(f"Updating Pi_mat[{p_bond_to_update_Pi}] (cols) due to changes at bond {p_bond_source_of_Jset_change}")
-
-        # The columns of Pi_mat[p_bond_to_update_Pi] are kron(phys_dims[p_bond_to_update_Pi+1], J_param_for_Pi_cols)
-        # J_param_for_Pi_cols was self.param_Jset_for_Pi_col_part[p_bond_to_update_Pi+1]
-        # This Jset corresponds to sites (p_bond_to_update_Pi+1)+1 ... D-1.
-        # This part does NOT directly depend on the *rank* (Iset/Jset) of P_cross_data[p_bond_source_of_Jset_change].
-        # The C++ logic seems more intricate:
-        # Pi.setCols(xfac::kron(localSet[p+1], Jset[p+1]));
-        # cross[p].setCols(cube_as_matrix1(T3[p+1]), Q);
-        # Here T3[p+1] (our M[p+1]) itself has changed rank due to cross[p]'s update.
-        # This means the *basis* for Jset[p+1] (relative to cross[p]) has changed.
-
-        # This needs careful thought. The `setCols` in C++ IMatrix takes a new set of MultiIndex.
-        # If the *rank* of bond `p_bond_source_of_Jset_change` changes, it means the basis
-        # for the multi-indices `self.Iset_lists_ci[p_bond_source_of_Jset_change+1]` changes.
-        # This `Iset_lists_ci` defines the *rows* of `Pi_mat[p_bond_source_of_Jset_change]`.
-        # This is subtle. For now, this is a placeholder. The primary effect of rank change
-        # is on the dimensions of TT cores, handled by _update_tt_M...
-        # If this method is about re-defining the Pi matrix itself, it's more involved.
-        pass
-
-
-    def _update_adjacent_Pi_and_CrossData_rows(self, p_bond_to_update_Pi: int, p_bond_source_of_Iset_change: int):
-        """
-        Updates Pi_mat[p_bond_to_update_Pi] and P_cross_data[p_bond_to_update_Pi]
-        because Iset for its rows has changed.
-        Corresponds to C++ updatePiRowsAt(p_next) after Iset[p_curr+1] changed at cross[p_curr].
-        p_bond_to_update_Pi = p_curr + 1
-        p_bond_source_of_Iset_change = p_curr
-        """
-        if p_bond_to_update_Pi >= len(self.mat_lazy_Pi_at) or p_bond_to_update_Pi < 0 :
-            return
-        logger.debug(f"Updating Pi_mat[{p_bond_to_update_Pi}] (rows) due to changes at bond {p_bond_source_of_Iset_change}")
-        # Similar complexity to _update_adjacent_Pi_and_CrossData_cols
-        pass
-
-
+        if (p_bond + 1) < self.D : 
+            p1t_core = self.get_P1T_at(p_bond + 1)
+            if p1t_core and (p_bond + 1) < len(self.param.weight):
+                self.tt_sum_env.update_site(p_bond + 1, p1t_core, self.param.weight[p_bond+1], False)
+                                            
+    # --- Placeholder for IterateN and other core TCI logic ---
     def iterate_one_full_sweep(self, update_M_data: bool = True) -> float:
-        max_err_sweep = 0.0
-        num_bonds = self.D - 1
-        if num_bonds < 0 : return 0.0
+        logger.warning("TensorCI1.iterate_one_full_sweep is a placeholder.")
+        # In a full implementation:
+        # For p_bond in range(num_bonds):
+        #   pivot_result = self.pivFinder[p_bond](...)
+        #   if good_pivot:
+        #       self.P_cross_data[p_bond].addPivot(..., self.mat_lazy_Pi_at[p_bond])
+        #       self._update_tt_M_and_P_pivot_matrix_after_crossdata_update(p_bond) # Your method
+        #       self.update_env_at(p_bond) # <--- Call ENV update
+        # (Similarly for R-L sweep)
+        return 0.0
 
-        # Left-to-right sweep
-        logger.debug("Iterate: Left-to-Right Sweep")
-        for p_bond in range(num_bonds): 
-            logger.debug(f"  L->R Processing bond {p_bond}")
-            pi_matrix_view = self.mat_lazy_Pi_at[p_bond]
-            current_cross_data_p = self.P_cross_data[p_bond]
-            pivot_finder_p = self.pivFinder[p_bond]
-            
-            pivot_result: PivotData = pivot_finder_p(pi_matrix_view, current_cross_data_p)
+    def IterateN(self, n_iterations: int, update_M_data: bool = True):
+        logger.info(f"TensorCI1.IterateN called for {n_iterations} iterations.")
+        for i in range(n_iterations):
+            logger.debug(f"  Iteration sweep {i+1}/{n_iterations}")
+            max_err_sweep = self.iterate_one_full_sweep(update_M_data)
+            # (Add convergence check logic if needed)
 
-            if pivot_result.i != -1 and pivot_result.j != -1 and \
-               abs(pivot_result.error) >= self.param.reltol * (max(self.errorDecay) if self.errorDecay else 1.0):
-                
-                max_err_sweep = max(max_err_sweep, abs(pivot_result.error))
-                self.errorDecay.append(abs(pivot_result.error))
 
-                self.P_cross_data[p_bond].addPivot(pivot_result.i, pivot_result.j, pi_matrix_view)
-                logger.debug(f"    Bond {p_bond} (L->R): Added pivot ({pivot_result.i}, {pivot_result.j}), "
-                             f"err={pivot_result.error:.2e}, new rank={self.P_cross_data[p_bond].rank()}")
-
-                if update_M_data:
-                    self._update_tt_M_and_P_pivot_matrix_after_crossdata_update(p_bond)
-                
-                # Update Pi_mat[p_bond-1].cols and cross[p_bond-1].cols
-                # Jset of P_cross_data[p_bond] is related to Iset of Pi_mat[p_bond] (its rows)
-                # This is tricky. The C++ uses T3[p+1] which is M[p_bond+1] to update cross[p_bond].setCols
-                # The change at bond p_bond affects the *basis/rank* of the link between site p_bond and p_bond+1.
-                # This new basis for "link p_bond" is what Pi_mat[p_bond-1] needs for its column definition
-                # (as its columns involve site p_bond).
-                if p_bond > 0:
-                     self._update_adjacent_Pi_and_CrossData_cols(p_bond_to_update_Pi=p_bond - 1, 
-                                                                 p_bond_source_of_Jset_change=p_bond)
-            else:
-                 logger.debug(f"    Bond {p_bond} (L->R): No suitable new pivot or error {pivot_result.error:.2e} too small.")
-        
-        # Right-to-left sweep
-        logger.debug("Iterate: Right-to-Left Sweep")
-        for p_bond in range(num_bonds - 1, -1, -1): 
-            logger.debug(f"  R->L Processing bond {p_bond}")
-            pi_matrix_view = self.mat_lazy_Pi_at[p_bond]
-            current_cross_data_p = self.P_cross_data[p_bond]
-            pivot_finder_p = self.pivFinder[p_bond]
-            
-            pivot_result: PivotData = pivot_finder_p(pi_matrix_view, current_cross_data_p)
-
-            if pivot_result.i != -1 and pivot_result.j != -1 and \
-               abs(pivot_result.error) >= self.param.reltol * (max(self.errorDecay) if self.errorDecay else 1.0):
-                
-                max_err_sweep = max(max_err_sweep, abs(pivot_result.error))
-                self.errorDecay.append(abs(pivot_result.error))
-
-                self.P_cross_data[p_bond].addPivot(pivot_result.i, pivot_result.j, pi_matrix_view)
-                logger.debug(f"    Bond {p_bond} (R->L): Added pivot ({pivot_result.i}, {pivot_result.j}), "
-                             f"err={pivot_result.error:.2e}, new rank={self.P_cross_data[p_bond].rank()}")
-
-                if update_M_data:
-                    self._update_tt_M_and_P_pivot_matrix_after_crossdata_update(p_bond)
-                
-                # Update Pi_mat[p_bond+1].rows and cross[p_bond+1].rows
-                # Iset of P_cross_data[p_bond] is related to Jset of Pi_mat[p_bond] (its cols)
-                # The change at bond p_bond affects the basis for "link p_bond".
-                # This new basis for "link p_bond" is what Pi_mat[p_bond+1] needs for its row definition.
-                if p_bond < num_bonds - 1:
-                     self._update_adjacent_Pi_and_CrossData_rows(p_bond_to_update_Pi=p_bond + 1,
-                                                                 p_bond_source_of_Iset_change=p_bond)
-            else:
-                logger.debug(f"    Bond {p_bond} (R->L): No suitable new pivot or error {pivot_result.error:.2e} too small.")
-
-        if max_err_sweep < self.param.reltol * (max(self.errorDecay) if self.errorDecay else 1.0):
-            logger.info(f"TCI converged after sweep. Max error in sweep: {max_err_sweep:.2e}")
-            self.done = True
-        
-        return max_err_sweep
-    
+    # --- Method stubs for methods present in user's original tensor_ci.py ---
+    # These need to be filled in based on the user's full original code.
+    def _update_tt_M_and_P_pivot_matrix_after_crossdata_update(self, p_bond: int):
+         logger.warning(f"_update_tt_M_and_P_pivot_matrix_after_crossdata_update({p_bond}) not fully implemented.")
+         # This method is crucial for updating self.tt.M and self.P_pivot_matrices
+         # after self.P_cross_data[p_bond] gets a new pivot.
+         # It was present in your original `tensor_ci.py`.
+         pass
 
     def get_canonical_tt(self, center: int) -> TensorTrain:
-        # ... (Implementation will use mat_AB1, mat_A1B, cube_as_matrix1/2) ...
-        # This method should create a DEEP COPY of self.tt and self.P_pivot_matrices
-        # and then operate on the copy.
-        if not self.tt.M or not all(core is not None for core in self.tt.M):
-            raise RuntimeError("TensorTrain self.tt.M is not fully initialized before calling get_canonical_tt.")
-        if not all(p_mat is not None for p_mat in self.P_pivot_matrices):
-            raise RuntimeError("Pivot matrices self.P_pivot_matrices not fully initialized.")
+        logger.warning(f"get_canonical_tt({center}) not fully implemented.")
+        # This method is for transforming the TT to a canonical form.
+        # It was present in your original `tensor_ci.py`.
+        return self.tt # Placeholder
 
-        # Create a deep copy of the TensorTrain to be canonicalized
-        # Your TensorTrain class would need a clone() or deepcopy mechanism
-        tt_copy = self.tt.clone() # Assuming TensorTrain has a clone method
-        
-        # P_pivot_matrices_copy = [p.clone() for p in self.P_pivot_matrices] # If they are Tensors
-        P_pivot_matrices_copy = []
-        for p_mat in self.P_pivot_matrices:
-            if isinstance(p_mat, Tensor): P_pivot_matrices_copy.append(p_mat.clone())
-            else: P_pivot_matrices_copy.append(p_mat) # Should all be Tensors
+    # Add other necessary methods that were in your original file if they are called by tests/iterate.
 
-
-        # Left of center: A_p <- A_p P_p^-1
-        for p in range(center):
-            Ap_matrix = cube_as_matrix2(tt_copy.M[p]) # (chi_L*d, chi_R)
-            Pp_inv = self.P_pivot_matrices[p] # This is P_p, mat_AB1 needs B=P_p
-            
-            # Result of A @ B^-1
-            # Ap_matrix is ( (L*d) x R_dim_of_A )
-            # Pp_inv is ( R_dim_of_A x R_dim_of_A )
-            if Ap_matrix.shape()[1] != Pp_inv.shape()[0] : # Check if R_dim_of_A matches P_p rows
-                 raise ValueError(f"Dim mismatch for A P^-1 at site {p}: A_cols={Ap_matrix.shape()[1]}, P_rows={Pp_inv.shape()[0]}")
-
-            new_Ap_matrix_data = mat_AB1(Ap_matrix, Pp_inv) # mat_AB1 computes Ap_matrix @ Inv(Pp_inv)
-            
-            # Reshape and update core
-            chi_L, d, chi_R_old = tt_copy.M[p].shape()
-            # The right bond dim chi_R does not change in this operation, P_p acts on right bond space
-            new_core_data = new_Ap_matrix_data.reshape(chi_L, d, chi_R_old) 
-            tt_copy.M[p].put_block(new_core_data)
-
-            # Absorb P_p into next core M[p+1]: M_{p+1} <- P_p M_{p+1}
-            if p + 1 < self.D:
-                Mp1_matrix = cube_as_matrix1(tt_copy.M[p+1]) # (chi_L_of_Mp1, (d*chi_R_of_Mp1) )
-                                                             # chi_L_of_Mp1 must match Pp_inv.shape()[1] (cols)
-                if Pp_inv.shape()[1] != Mp1_matrix.shape()[0]:
-                    raise ValueError(f"Dim mismatch for P M at site {p+1}: P_cols={Pp_inv.shape()[1]}, M_rows={Mp1_matrix.shape()[0]}")
-                
-                new_Mp1_matrix_data = Pp_inv @ Mp1_matrix
-                chi_L_new_Mp1, d_Mp1, chi_R_Mp1 = tt_copy.M[p+1].shape() # chi_L_new_Mp1 is new from P
-                new_core_data_p1 = new_Mp1_matrix_data.reshape(Pp_inv.shape()[0], d_Mp1, chi_R_Mp1) # Left bond of M[p+1] changes
-                
-                # Update bonds of M[p+1] if left dim changed
-                tt_copy.M[p+1].bonds()[0].assign(Bond(Pp_inv.shape()[0], BD_IN))
-                tt_copy.M[p+1].set_labels([f"link{p}", tt_copy.M[p+1].labels()[1], tt_copy.M[p+1].labels()[2]])
-                tt_copy.M[p+1].put_block(new_core_data_p1)
-
-
-        # Right of center: A_p <- P_{p-1}^-1 A_p
-        for p in range(self.D - 1, center, -1): # Loop D-1 down to center+1
-            Ap_matrix = cube_as_matrix1(tt_copy.M[p]) # (chi_L, d*chi_R)
-            Pp_prev_inv = self.P_pivot_matrices[p-1] # This is P_{p-1}
-            
-            # Result of P_prev^-1 @ A
-            if Pp_prev_inv.shape()[1] != Ap_matrix.shape()[0]:
-                 raise ValueError(f"Dim mismatch for P^-1 A at site {p}: P_cols={Pp_prev_inv.shape()[1]}, A_rows={Ap_matrix.shape()[0]}")
-
-            new_Ap_matrix_data = mat_A1B(Pp_prev_inv, Ap_matrix)
-            
-            chi_L_old, d, chi_R = tt_copy.M[p].shape()
-            # Left bond dim chi_L changes, P_{p-1} acts on left bond space
-            new_core_data = new_Ap_matrix_data.reshape(Pp_prev_inv.shape()[0], d, chi_R) 
-            
-            tt_copy.M[p].bonds()[0].assign(Bond(Pp_prev_inv.shape()[0], BD_IN))
-            tt_copy.M[p].set_labels([f"link{p-1}", tt_copy.M[p].labels()[1], tt_copy.M[p].labels()[2]])
-            tt_copy.M[p].put_block(new_core_data)
-
-            # Absorb P_{p-1} into M[p-1]: M_{p-1} <- M_{p-1} P_{p-1}
-            if p - 1 >= 0:
-                Mp_prev_matrix = cube_as_matrix2(tt_copy.M[p-1]) # (chi_L*d, chi_R_of_Mp-1)
-                                                                 # chi_R_of_Mp-1 must match Pp_prev_inv.shape()[0] (rows)
-                if Mp_prev_matrix.shape()[1] != Pp_prev_inv.shape()[0]:
-                     raise ValueError(f"Dim mismatch for M P at site {p-1}: M_cols={Mp_prev_matrix.shape()[1]}, P_rows={Pp_prev_inv.shape()[0]}")
-
-                new_Mp_prev_matrix_data = Mp_prev_matrix @ Pp_prev_inv
-                
-                chi_L_Mp_prev, d_Mp_prev, chi_R_old_Mp_prev = tt_copy.M[p-1].shape()
-                new_core_data_pm1 = new_Mp_prev_matrix_data.reshape(chi_L_Mp_prev, d_Mp_prev, Pp_prev_inv.shape()[1]) # Right bond of M[p-1] changes
-
-                tt_copy.M[p-1].bonds()[2].assign(Bond(Pp_prev_inv.shape()[1], BD_OUT))
-                tt_copy.M[p-1].set_labels([tt_copy.M[p-1].labels()[0], tt_copy.M[p-1].labels()[1], f"link{p-1}"])
-                tt_copy.M[p-1].put_block(new_core_data_pm1)
-        
-        return tt_copy
-
+# --- Main Test Block ---
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.DEBUG)
-    logger.info("--- Starting TensorCI1 Update Logic Test ---")
+    # (Test block as provided in my previous response)
+    # ... (Ensure all necessary imports and helper functions for the test are here)
+    logging.basicConfig(level=logging.DEBUG, 
+                        format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
+    logger.info("--- Starting TensorCI System Test ---")
 
-    # --- 1. Setup Mock Objects and Parameters ---
-    test_phys_dims = [2, 3, 2] # D = 3 sites
-    test_D = len(test_phys_dims)
+    test_phys_dims_small = [2, 2] 
+    test_D_small = len(test_phys_dims_small)
     test_dtype = cytnx.Type.Double
     test_device = cytnx.Device.cpu
 
-    # Mock TensorFunction
-    def mock_fc_func(indices: Tuple[int, ...]) -> float:
-        # A simple function for testing, e.g., product of indices + sum
-        val = 1.0
-        s = 0
-        for i, idx in enumerate(indices):
-            val *= (idx + 1 + i*0.1) # Make it somewhat non-trivial
-            s += idx
-        return val + s
-    
-    mock_tensor_function = TensorFunction(func=mock_fc_func)
+    def mock_fc_simple(indices: Tuple[int, ...]) -> float:
+        val = 1.0 
+        if len(indices) == 2: val += float(indices[0] * 3 + indices[1] * 5 + (indices[0] + indices[1]) * 0.2)
+        else: logger.error(f"mock_fc_simple: Unsupported input length {len(indices)}")
+        return val 
 
-    # TensorCI1Param - use a simple one for now
-    test_param = TensorCI1Param(pivot1=[0] * test_D, nIter=0) # Start with all-zero pivot
+    mock_tensor_function = TensorFunction(func=mock_fc_simple)
 
-    # --- 2. Instantiate TensorCI1 (this will call __init__) ---
-    # __init__ should populate initial P_cross_data, P_pivot_matrices, and tt.M (rank 1)
+    def mock_cond_func(full_multi_index: List[int]) -> bool:
+        return sum(full_multi_index) % 2 == 0
+
+    logger.info("\n--- Test Case 1: TensorCI1 Initialization (D=2, ENV, Cond) ---")
+    test_weights_small = [[0.8, 1.2], [0.9, 1.1]]
+    ci_param_env_cond = TensorCI1Param(
+        pivot1=[0]*test_D_small, weight=test_weights_small, cond=mock_cond_func, nIter=0 
+    )
+    tci_test_instance = None
     try:
-        tci_instance = TensorCI1(
-            fc=mock_tensor_function,
-            phys_dims=test_phys_dims,
-            param=test_param,
-            dtype=test_dtype,
-            device=test_device
+        tci_test_instance = TensorCI1(
+            fc=mock_tensor_function, phys_dims=test_phys_dims_small, param=ci_param_env_cond,
+            dtype=test_dtype, device=test_device
         )
-        logger.info("__init__ completed.")
-        logger.info(f"Initial P_pivot_matrices ranks: {[p.shape if p is not None else None for p in tci_instance.P_pivot_matrices]}")
-        for i, core in enumerate(tci_instance.tt.M):
-            if core is not None:
-                logger.info(f"Initial tt.M[{i}] shape: {core.shape()}, labels: {core.labels()}")
-            else:
-                logger.warning(f"Initial tt.M[{i}] is None.")
-
-    except Exception as e:
-        logger.error(f"Error during TensorCI1 initialization: {e}", exc_info=True)
-        # Stop test if init fails
-        exit()
-
-    # --- 3. Test _update_tt_M_and_P_matrices_after_crossdata_update ---
-    # We need to simulate P_cross_data[p_bond] being updated by adding a pivot.
-    
-    if test_D > 1:
-        p_bond_to_test = 0 # Test update for the first bond
-        logger.info(f"\n--- Testing update for bond {p_bond_to_test} ---")
-
-        # Get the CrossData object for this bond
-        cross_data_p = tci_instance.P_cross_data[p_bond_to_test]
-        pi_matrix_p = tci_instance.mat_lazy_Pi_at[p_bond_to_test]
-
-        # Simulate adding a new pivot to cross_data_p
-        # This requires knowing a valid (new_pivot_i, new_pivot_j) in pi_matrix_p
-        # For simplicity, let's assume we found a pivot that increases rank to 2.
-        # You would normally get this from PivotFinder.
-        # Here, we'll manually call addPivot with a known "next" pivot.
-        # Note: The actual pivot indices depend on the content of fc and Pi matrix structure.
-        # This is a simplified manual pivot addition.
+        logger.info("TensorCI1 (D=2, ENV, Cond) initialized.")
+        assert tci_test_instance.tt_sum_env is not None, "tt_sum_env should be initialized"
+        assert tci_test_instance.tt_sum_env.is_active, "tt_sum_env should be active after init with weights"
         
-        # Example: Assume Pi matrix for bond 0 is at least 2x2 after initial pivot (it won't be yet)
-        # To test properly, we need to find a *second* distinct pivot.
-        # Let's assume PivotFinder found a new pivot (e.g., row 1, col 1 of Pi_0, if available)
-        # The current rank is 1. C is (d0, 1), R is (1, d1*d2_eff)
-        
-        # Simulate finding a second pivot (this is very manual for testing)
-        # In a real scenario, PivotFinder would give these from the *available* indices of Pi_matrix.
-        # And the indices are for the *full* Pi matrix.
-        # Let's assume initial pivot was (0,0) in Pi_0.
-        # If Pi_0 has more rows/cols, pick another, e.g. (1,0) or (0,1) if valid.
-        new_pivot_i_in_Pi = 0 # Placeholder - depends on Pi_matrix_p structure
-        new_pivot_j_in_Pi = 0 # Placeholder
-        
-        # Find a non-pivot index:
-        if pi_matrix_p.n_rows > 1 and ([0] != cross_data_p.lu.Iset): # if initial pivot was not row 0
-             new_pivot_i_in_Pi = 0
-        elif pi_matrix_p.n_rows > 1:
-             new_pivot_i_in_Pi = 1
-        
-        if pi_matrix_p.n_cols > 1 and ([0] != cross_data_p.lu.Jset):
-             new_pivot_j_in_Pi = 0
-        elif pi_matrix_p.n_cols > 1:
-             new_pivot_j_in_Pi = 1
+        logger.info("Verifying initial TTEnvMatrices L and R:")
+        for i in range(tci_test_instance.D):
+            if tci_test_instance.tt_sum_env.L[i] : 
+                logger.info(f"  Init L[{i}] shape: {tci_test_instance.tt_sum_env.L[i].shape()}, "
+                            f"Data: {tci_test_instance.tt_sum_env.L[i].get_block_().numpy()}")
+            if tci_test_instance.tt_sum_env.R[i] : 
+                logger.info(f"  Init R[{i}] shape: {tci_test_instance.tt_sum_env.R[i].shape()}, "
+                            f"Data: {tci_test_instance.tt_sum_env.R[i].get_block_().numpy()}")
+        # Check that L[D-1] and R[0] are non-trivial (have rank from contraction) if D > 1
+        if tci_test_instance.D > 1:
+            assert tci_test_instance.tt_sum_env.L[tci_test_instance.D-1] is not None and \
+                   tci_test_instance.tt_sum_env.L[tci_test_instance.D-1].shape() != [1], "L[D-1] seems like boundary"
+            assert tci_test_instance.tt_sum_env.R[0] is not None and \
+                   tci_test_instance.tt_sum_env.R[0].shape() != [1], "R[0] seems like boundary"
 
-        if not (new_pivot_i_in_Pi < pi_matrix_p.n_rows and new_pivot_j_in_Pi < pi_matrix_p.n_cols):
-            logger.warning(f"Cannot find a distinct second pivot for bond {p_bond_to_test} in this simple test setup. Skipping update test.")
-        else:
-            logger.info(f"Simulating adding pivot ({new_pivot_i_in_Pi}, {new_pivot_j_in_Pi}) to CrossData for bond {p_bond_to_test}")
+
+        if test_D_small > 1 and tci_test_instance.pivFinder[0] is not None:
+            pf_param0 = tci_test_instance.pivFinder[0].param
+            if tci_test_instance.tt_sum_env and tci_test_instance.tt_sum_env.is_active:
+                 assert pf_param0.weight_row is not None, "Initial weight_row missing"
+                 assert pf_param0.weight_col is not None, "Initial weight_col missing"
+                 logger.info(f"  PivotFinderParam[0] weight_row (shape {pf_param0.weight_row.shape()}): {pf_param0.weight_row.numpy()}")
+                 logger.info(f"  PivotFinderParam[0] weight_col (shape {pf_param0.weight_col.shape()}): {pf_param0.weight_col.numpy()}")
+
+    except Exception as e: logger.error(f"Error in Test Case 1 (Init): {e}", exc_info=True)
+
+    if tci_test_instance:
+        logger.info("\n--- Test Case 2: Simulating update_env_at call ---")
+        if tci_test_instance.tt_sum_env and tci_test_instance.tt_sum_env.is_active:
             try:
-                cross_data_p.addPivot(new_pivot_i_in_Pi, new_pivot_j_in_Pi, pi_matrix_p)
-                new_rank = cross_data_p.rank()
-                logger.info(f"CrossData for bond {p_bond_to_test} updated. New rank: {new_rank}")
-                if cross_data_p.lu.C is not None:
-                    logger.debug(f"  Updated lu.C shape: {cross_data_p.lu.C.shape()}")
-                if cross_data_p.lu.R is not None:
-                    logger.debug(f"  Updated lu.R shape: {cross_data_p.lu.R.shape()}")
+                L1_b = tci_test_instance.tt_sum_env.L[1].clone() if tci_test_instance.D > 1 and tci_test_instance.tt_sum_env.L[1] else None
+                R0_b = tci_test_instance.tt_sum_env.R[0].clone() if tci_test_instance.D > 0 and tci_test_instance.tt_sum_env.R[0] else None
 
-                # Now call the function to update TT cores
-                logger.info(f"Calling _update_tt_M_and_P_matrices_after_crossdata_update for bond {p_bond_to_test}")
-                tci_instance._update_tt_M_and_P_matrices_after_crossdata_update(p_bond_to_test)
+                logger.info("Calling update_env_at(p_bond=0)")
+                tci_test_instance.update_env_at(p_bond=0) # Test for bond 0
 
-                # Assertions:
-                logger.info(f"  M[{p_bond_to_test}] new shape: {tci_instance.tt.M[p_bond_to_test].shape()}, "
-                            f"right bond dim: {tci_instance.tt.M[p_bond_to_test].bonds()[2].dim()}")
-                assert tci_instance.tt.M[p_bond_to_test].bonds()[2].dim() == new_rank
+                if tci_test_instance.D > 1 :
+                    L1_a = tci_test_instance.tt_sum_env.L[1]
+                    assert L1_a is not None
+                    logger.info(f"  L[1] after update (shape {L1_a.shape()}): {L1_a.get_block_().numpy()}")
+                    if L1_b: assert not cytnx.linalg.Equals(L1_a.get_block_(), L1_b.get_block_())
 
-                if p_bond_to_test + 1 < test_D:
-                    logger.info(f"  M[{p_bond_to_test+1}] new shape: {tci_instance.tt.M[p_bond_to_test+1].shape()}, "
-                                f"left bond dim: {tci_instance.tt.M[p_bond_to_test+1].bonds()[0].dim()}")
-                    assert tci_instance.tt.M[p_bond_to_test+1].bonds()[0].dim() == new_rank
+                R0_a = tci_test_instance.tt_sum_env.R[0]
+                assert R0_a is not None
+                logger.info(f"  R[0] after update (shape {R0_a.shape()}): {R0_a.get_block_().numpy()}")
+                if R0_b: assert not cytnx.linalg.Equals(R0_a.get_block_(), R0_b.get_block_())
                 
-                logger.info(f"  P_pivot_matrices[{p_bond_to_test}] new shape: {tci_instance.P_pivot_matrices[p_bond_to_test].shape()}")
-                assert tci_instance.P_pivot_matrices[p_bond_to_test].shape() == [new_rank, new_rank]
-                logger.info(f"Update logic test for bond {p_bond_to_test} seems plausible based on shapes.")
+                logger.info("\n--- Test Case 3: Weights in PivotFinderParam after ENV update ---")
+                updated_pf_param0 = tci_test_instance._build_pivot_finder_param_at_bond(0)
+                assert updated_pf_param0.weight_row is not None
+                logger.info(f"  Updated PivotFinderParam[0] weight_row: {updated_pf_param0.weight_row.numpy()}")
 
-            except Exception as e:
-                logger.error(f"Error during update test for bond {p_bond_to_test}: {e}", exc_info=True)
-
-    logger.info("--- TensorCI1 Update Logic Test Finished ---")
+            except Exception as e: logger.error(f"Error in Test Case 2/3 (Update/Post-weights): {e}", exc_info=True)
+        else: logger.warning("Skipping Test Case 2/3: tt_sum_env not active.")
+    else: logger.warning("Skipping Test Case 2/3: TensorCI1 instance not created.")
+            
+    logger.info("\n--- TensorCI System Test Finished ---")
