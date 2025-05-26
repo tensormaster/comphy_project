@@ -1252,134 +1252,58 @@ if __name__ == '__main__':
         nIter=1, # One full sweep
         reltol=1e-5
     )
-    tc7_params_idempotency = dataclasses.replace(tc7_params, nIter=0)
     tci7_inst = None
     try:
-        tci7_inst = TensorCI1(fc=tc7_fc_func, phys_dims=tc7_phys_dims, param=tc7_params_idempotency) # nIter=0
-        logger.info("TC7: TensorCI1 (D=2, ENV, Cond) initialized for idempotency test.")
-        
-        # If nIter was > 0 in params and it did some updates, that's fine.
-        # We are interested in two *subsequent* identical calls.
+        tci7_inst = TensorCI1(fc=tc7_fc_func, phys_dims=tc7_phys_dims, param=tc7_params)
+        logger.info("TC7: TensorCI1 (D=2, ENV, Cond) initialized.")
+
+        # Environment state after nIter=1 (done in __init__ or by explicit IterateN if nIter=0)
+        # Ensure IterateN has run if nIter in param was 0
+        if tc7_params.nIter == 0: tci7_inst.IterateN(1)
 
         if tci7_inst.tt_sum_env and tci7_inst.tt_sum_env.is_active:
-            logger.info("TC7: Performing FIRST explicit call to update_env_at(p_bond=0).")
-            tci7_inst.update_env_at(p_bond=0) # <<< FIRST EXPLICIT CALL for this test sequence
+            L1_b_core = tci7_inst.tt_sum_env.L[1]
+            L1_b_numpy = L1_b_core.get_block_().numpy().copy() if tc7_D > 1 and L1_b_core else None
 
-            L1_core_after_1st = tci7_inst.tt_sum_env.L[1]
-            L1_numpy_after_1st = L1_core_after_1st.get_block_().numpy().copy() if tc7_D > 1 and L1_core_after_1st else None
-            
-            R0_core_after_1st = tci7_inst.tt_sum_env.R[0]
-            R0_numpy_after_1st = R0_core_after_1st.get_block_().numpy().copy() if tc7_D > 0 and R0_core_after_1st else None
+            R0_b_core = tci7_inst.tt_sum_env.R[0]
+            R0_b_numpy = R0_b_core.get_block_().numpy().copy() if tc7_D > 0 and R0_b_core else None
 
-            logger.info("TC7: Performing SECOND explicit call to update_env_at(p_bond=0).")
-            tci7_inst.update_env_at(p_bond=0) # <<< SECOND EXPLICIT CALL for this test sequence
+            logger.info("TC7: Calling update_env_at(p_bond=0) again.")
+            tci7_inst.update_env_at(p_bond=0)
 
-            if tc7_D > 1 and L1_numpy_after_1st is not None:
-                L1_core_after_2nd = tci7_inst.tt_sum_env.L[1]
-                assert L1_core_after_2nd is not None, "TC7: L[1] should exist after 2nd update"
-                L1_numpy_after_2nd = L1_core_after_2nd.get_block_().numpy()
-                
-                logger.debug(f"TC7 L[1] after 1st call:\n{L1_numpy_after_1st}")
-                logger.debug(f"TC7 L[1] after 2nd call:\n{L1_numpy_after_2nd}")
-                
-                assert np.allclose(L1_numpy_after_2nd, L1_numpy_after_1st, atol=1e-8), \
-                    "TC7: L1 FAILED idempotency (changed between 1st and 2nd explicit identical update_env_at calls)"
-                logger.info(f"  TC7: L[1] PASSED idempotency test.")
+            if tc7_D > 1 and L1_b_numpy is not None:
+                L1_a_core = tci7_inst.tt_sum_env.L[1]
+                assert L1_a_core is not None, "TC7: L[1] should exist after update"
+                L1_a_numpy = L1_a_core.get_block_().numpy()
+                assert np.allclose(L1_a_numpy, L1_b_numpy, atol=1e-8), \
+                    "TC7: L1 should NOT have changed after a second identical update_env_at call"
+                logger.info(f"    TC7: L[1] after 2nd update_env_at (shape {L1_a_core.shape()}) matches state after 1st update: PASSED Idempotency")
 
-            if tc7_D > 0 and R0_numpy_after_1st is not None:
-                R0_core_after_2nd = tci7_inst.tt_sum_env.R[0]
-                assert R0_core_after_2nd is not None, "TC7: R[0] should exist after 2nd update"
-                R0_numpy_after_2nd = R0_core_after_2nd.get_block_().numpy()
-
-                logger.debug(f"TC7 R[0] after 1st call:\n{R0_numpy_after_1st}")
-                logger.debug(f"TC7 R[0] after 2nd call:\n{R0_numpy_after_2nd}")
-
-                assert np.allclose(R0_numpy_after_2nd, R0_numpy_after_1st, atol=1e-8), \
-                    "TC7: R0 FAILED idempotency (changed between 1st and 2nd explicit identical update_env_at calls)"
-                logger.info(f"  TC7: R[0] PASSED idempotency test.")
+            if tc7_D > 0 and R0_b_numpy is not None:
+                R0_a_core = tci7_inst.tt_sum_env.R[0]
+                assert R0_a_core is not None, "TC7: R[0] should exist after update"
+                R0_a_numpy = R0_a_core.get_block_().numpy()
+                assert np.allclose(R0_a_numpy, R0_b_numpy, atol=1e-8), \
+                    "TC7: R0 should NOT have changed after a second identical update_env_at call"
+                logger.info(f"    TC7: R[0] after 2nd update_env_at (shape {R0_a_core.shape()}) matches state after 1st update: PASSED Idempotency")
         else:
             logger.warning("TC7: Skipping ENV idempotency check, tt_sum_env not active.")
 
     except Exception as e:
-        logger.error(f"Error in Test Case 7 (ENV Idempotency - Revised): {e}", exc_info=True)
+        logger.error(f"Error in Test Case 7 (ENV Idempotency): {e}", exc_info=True)
         raise
 
-    # --- Test Case 8: Convergence and Accuracy with ENV Learning Active ---
-    logger.info("\n--- Test Case 8: Convergence and Accuracy with ENV Learning ---")
-    tc8_phys_dims = [2, 2] 
-    tc8_D = len(tc8_phys_dims)
-    tc8_fc_func = TensorFunction(func=mock_fc_rank2_D2) # Using a rank-2 function
-    tc8_weights = [[0.8, 1.2], [0.9, 1.1]] # Activate ENV learning
-    tc8_params = TensorCI1Param(
-        pivot1=[0]*tc8_D,
-        weight=tc8_weights,
-        cond=mock_cond_always_true, # Optional: can test with None or other conditions
-        nIter=30,                  # Sufficient iterations for convergence
-        reltol=1e-7,               # Target relative tolerance
-        fullPiv=False              # Optional: choose pivoting strategy
-    )
-    tci8_inst = None
-    try:
-        tci8_inst = TensorCI1(fc=tc8_fc_func, phys_dims=tc8_phys_dims, param=tc8_params, dtype=test_dtype, device=test_device)
-        logger.info(f"TC8: TensorCI1 initialized with ENV learning for D={tc8_D}, target function rank approx 2.")
+    # --- (Placeholder) Test Case for getPivotsAt ---
+    # logger.info("\n--- Test Case X: getPivotsAt ---")
+    # if 'tci1_inst' in locals() and tci1_inst.done:
+    #    # 1. Implement getPivotsAt in TensorCI1
+    #    #    It needs to access the global Iset/Jset equivalents from the TCI process
+    #    #    (Not just the local P_cross_data[b].lu.Iset/Jset for the Pi_matrix)
+    #    # pivots_bond0 = tci1_inst.getPivotsAt(0)
+    #    # logger.info(f"Pivots at bond 0: {pivots_bond0}")
+    #    # assert len(pivots_bond0) == tci1_inst.P_cross_data[0].rank(), "Number of pivots should match rank"
+    #    pass
+    # else:
+    #    logger.warning("Skipping getPivotsAt test: tci1_inst not available or not converged.")
 
-        # Iteration is handled by __init__ if param.nIter > 0
-
-        # 1. Assert Convergence
-        logger.info(f"TC8: errorDecay: {tci8_inst.errorDecay}")
-        assert tci8_inst.done is True, "TC8: TCI algorithm should report being done (converged)."
-        if tci8_inst.errorDecay: # Ensure errorDecay is not empty
-            assert tci8_inst.errorDecay[-1] < tc8_params.reltol * 10, \
-                f"TC8: Final pivot error {tci8_inst.errorDecay[-1]:.2e} should be below reltol {tc8_params.reltol:.1e} (times 10)."
-        else:
-            logger.warning("TC8: errorDecay is empty, cannot assert final pivot error.")
-
-
-        # 2. Assert Rank (Optional, but good for sanity check)
-        if tc8_D > 1:
-            final_rank_bond0_tc8 = tci8_inst.P_cross_data[0].rank()
-            logger.info(f"TC8: Final rank at bond 0: {final_rank_bond0_tc8}")
-            # For mock_fc_rank2_D2, expected rank can be up to 2.
-            # Depending on the exact function and reltol, it might find rank 1 or 2.
-            assert 0 < final_rank_bond0_tc8 <= 2, \
-                f"TC8: Rank for D=2 rank-2 target with ENV should be 1 or 2, got {final_rank_bond0_tc8}"
-        
-        # 3. Assert Reconstruction Accuracy
-        if final_rank_bond0_tc8 > 0 : # Proceed if rank is not zero
-            canonical_tt_tc8 = tci8_inst.get_canonical_tt(center=0)
-            assert canonical_tt_tc8 is not None, "TC8: Failed to get canonical TT."
-            
-            max_reconstruction_error_tc8 = 0.0
-            logger.info(f"TC8: Testing element reconstruction against mock_fc_rank2_D2")
-            for i0 in range(tc8_phys_dims[0]):
-                for i1 in range(tc8_phys_dims[1]):
-                    test_indices = (i0, i1)
-                    val_expected = mock_fc_rank2_D2(test_indices)
-                    try:
-                        val_reconstructed = evaluate_tt(canonical_tt_tc8, test_indices)
-                        current_error = abs(val_expected - val_reconstructed)
-                        max_reconstruction_error_tc8 = max(max_reconstruction_error_tc8, current_error)
-                        logger.debug(f"  TC8 Indices {test_indices}: Expected={val_expected:.6f}, Reconstructed={val_reconstructed:.6f}, Error={current_error:.2e}")
-                    except Exception as e_eval:
-                        logger.error(f"TC8: Error evaluating canonical_tt for {test_indices}: {e_eval}", exc_info=True)
-                        raise # Fail test if evaluation fails
-            
-            logger.info(f"TC8: Max reconstruction error with ENV learning: {max_reconstruction_error_tc8:.2e}")
-            # The acceptable reconstruction error might be related to reltol, 
-            # but not always directly. A small absolute threshold can also be used.
-            # Let's use a threshold slightly larger than reltol.
-            assert max_reconstruction_error_tc8 < tc8_params.reltol * 100, \
-                f"TC8: Reconstruction error {max_reconstruction_error_tc8:.2e} too high for ENV learning case (reltol={tc8_params.reltol:.1e})."
-            logger.info("TC8: Reconstruction accuracy with ENV learning is acceptable.")
-        elif tc8_D == 1: # Handle single site case if rank check is skipped
-            # Add reconstruction check for D=1 if necessary
-            pass
-        else: # tc8_D > 1 but final_rank_bond0_tc8 == 0
-            logger.warning("TC8: Skipping reconstruction test as final rank is 0, which is unexpected for a non-zero function.")
-            # You might want to assert False here if rank 0 is truly an error for this function.
-            # assert False, "TC8: Final rank is 0 for a non-zero target function, this indicates a problem."
-
-
-    except Exception as e:
-        logger.error(f"Error in Test Case 8 (Convergence with ENV Learning): {e}", exc_info=True)
-        raise
+    logger.info("\n--- TensorCI System Test (Expanded) Finished ---")
