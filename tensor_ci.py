@@ -300,7 +300,13 @@ class TensorCI1:
         if abs(initial_pivot_value) < 1e-15: 
             raise ValueError(f"f({self.initial_pivot_multi_index}) = {initial_pivot_value} is ~zero.")
 
+        ### MODIFICATION START ###
+        # 定義 num_bonds
         num_bonds = self.D - 1 if self.D > 0 else 0
+
+        # 初始化 self.bond_pivots_multi_idx
+        self.bond_pivots_multi_idx: List[List[Tuple[MultiIndex, MultiIndex]]] = [[] for _ in range(num_bonds)]
+        ### MODIFICATION END ###
 
         self.localSet: List[IndexSet] = [] # Store IndexSet objects
         for i, d_p in enumerate(phys_dims):
@@ -370,8 +376,18 @@ class TensorCI1:
             
             logger.debug(f"TensorCI1 __init__: Adding initial pivot ({pivot_i_in_Pi_p}, {pivot_j_in_Pi_p}) for P_cross_data[{p_bond}]") # DEBUG
             self.P_cross_data[p_bond].addPivot(pivot_i_in_Pi_p, pivot_j_in_Pi_p, self.mat_lazy_Pi_at[p_bond])
-            logger.debug(f"TensorCI1 __init__: P_cross_data[{p_bond}] rank after initial pivot: {self.P_cross_data[p_bond].rank()}") # DEBUG
-
+            ### MODIFICATION START ###
+            # Store the initial MultiIndex pivot for this bond
+            # Ensure p_bond is a valid index for self.bond_pivots_multi_idx
+            if p_bond < len(self.bond_pivots_multi_idx):
+                 self.bond_pivots_multi_idx[p_bond].append(
+                     (row_pivot_mi_for_Pi_p, col_pivot_mi_for_Pi_p)
+                 )
+            else:
+                # This case should ideally not be reached if num_bonds is correct
+                logger.error(f"Error: p_bond {p_bond} is out of range for self.bond_pivots_multi_idx (len {len(self.bond_pivots_multi_idx)})")
+            ### MODIFICATION END ###
+            
 
         self.tt = TensorTrain() 
         self.tt.M = [None] * self.D
@@ -771,6 +787,8 @@ class TensorCI1:
 
 
     def _update_tt_M_and_P_pivot_matrix_after_crossdata_update(self, p_bond: int):
+
+
         """
         Updates TT cores and P_pivot_matrices based on updated CrossData and global Iset/Jset.
         This function needs to re-evaluate the relevant cores and pivot matrices.

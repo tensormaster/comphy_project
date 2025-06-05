@@ -465,6 +465,7 @@ class MatLazyIndex(IMatrixIndex, MatLazy):
             return self.A(xi,yj)
         MatLazy.set_cols(self, self.n_cols, Q, fnew_int_for_lazy)
         return Q
+    
 
 # --- Factory Function ---
 def make_IMatrix(f: Callable, n_rows_or_Iset: Any, n_cols_or_Jset: Any, 
