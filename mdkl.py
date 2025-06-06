@@ -64,7 +64,7 @@ if __name__ == "__main__":
     print("-" * 55)
 
     # 執行迭代
-    for i in range(1, 50):
+    for i in range(1, 3):
         ci.iterate_one_full_sweep() # 將 .iterate() 修改為 .iterate_one_full_sweep()
         if i % 10 == 0:
             # 獲取 TensorTrain 實例並計算積分

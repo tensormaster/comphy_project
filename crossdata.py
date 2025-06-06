@@ -1,4 +1,4 @@
-# filename: crossdata.py (Further Corrected - Attempt 5: Using manual_vstack)
+# tensormaster/comphy_project/comphy_project-main/crossdata.py
 
 import logging
 import numpy as np
@@ -54,6 +54,120 @@ class CrossData:
         self.lu = AdaptiveLU(n_rows, n_cols)
         self.cache: Dict[str, Any] = {'LD': None, 'I_avail': None, 'J_avail': None}
         logger.debug(f"Initialized CrossData with {n_rows} rows and {n_cols} columns.")
+
+    def sync_and_rebuild_pivots(self, A: IMatrix):
+        """
+        Synchronizes dimensions with matrix A and rebuilds pivot matrices C and R.
+        """
+        if self.n_rows == A.n_rows and self.n_cols == A.n_cols:
+            return  # No change needed
+
+        logger.info(f"Syncing CrossData dims from ({self.n_rows},{self.n_cols}) to ({A.n_rows},{A.n_cols}) and rebuilding C, R.")
+
+        self.n_rows = A.n_rows
+        self.n_cols = A.n_cols
+        self.lu.n_rows = A.n_rows
+        self.lu.n_cols = A.n_cols
+
+        # Rebuild C and R from scratch using existing pivot indices
+        self.C = None
+        self.R = None
+
+        if not self.lu.Jset:  # No pivots yet, nothing to rebuild
+            return
+
+        # Rebuild C from pivot columns
+        pivot_cols_to_rebuild = list(self.lu.Jset)
+        for j_pivot_idx in pivot_cols_to_rebuild:
+            col_tensor = A.get_col_as_tensor(j_pivot_idx)
+            col_2d = ensure_2d(col_tensor.clone(), axis=0)
+            if self.C is None:
+                self.C = col_2d
+            else:
+                self.C = manual_hstack(self.C, col_2d)
+
+        # Rebuild R from pivot rows
+        pivot_rows_to_rebuild = list(self.lu.Iset)
+        for i_pivot_idx in pivot_rows_to_rebuild:
+            row_tensor = A.get_row_as_tensor(i_pivot_idx)
+            row_2d = ensure_2d(row_tensor.clone(), axis=1)
+            if self.R is None:
+                self.R = row_2d
+            else:
+                self.R = manual_vstack(self.R, row_2d)
+        
+        # Clear cache as matrices have changed
+        self.cache = {'LD': None, 'I_avail': None, 'J_avail': None}
+        
+        logger.info(f"Rebuilt C (shape {self.C.shape if self.C else 'None'}) and R (shape {self.R.shape if self.R else 'None'})")
+
+
+    def pivotMat(self) -> Optional[Tensor]:
+        if self.C is None or not isinstance(self.lu.Iset, (list, tuple)) or not self.lu.Iset:
+            logger.debug("pivotMat: C is None or lu.Iset is empty. Returning None.")
+            return None
+
+        current_rank = self.rank()
+        if current_rank == 0:
+            logger.debug("pivotMat: Current rank is 0. Returning None.")
+            return None
+
+        try:
+            iset_np = np.array(self.lu.Iset, dtype=np.int64)
+            if iset_np.size == 0:
+                logger.warning("pivotMat: Iset is effectively empty. Returning None.")
+                return None
+
+            # Check bounds before proceeding with slicing/taking
+            if np.max(iset_np) >= self.C.shape()[0]:
+                logger.error(f"pivotMat: Max Iset index {np.max(iset_np)} out of bounds for C shape {self.C.shape()}.")
+                return None
+
+            # --- MODIFICATION START (Attempt 5: Using manual_vstack for concatenation) ---
+            pivot_matrix_candidate: Optional[Tensor] = None
+            if iset_np.size > 0:
+                # Get the first row
+                first_row = self.C[iset_np[0], :]
+                pivot_matrix_candidate = ensure_2d(first_row, axis=1) # Ensure (1, N)
+
+                # Manually vstack subsequent rows
+                for i in range(1, iset_np.size):
+                    next_row = self.C[iset_np[i], :]
+                    pivot_matrix_candidate = manual_vstack(pivot_matrix_candidate, ensure_2d(next_row, axis=1))
+            else:
+                # If no rows selected, return an empty matrix with correct column dimension
+                # This case is already covered by iset_np.size == 0 check above, but for completeness.
+                pivot_matrix_candidate = cytnx.zeros((0, self.C.shape()[1]), dtype=self.C.dtype(), device=self.C.device())
+
+            if pivot_matrix_candidate is None:
+                logger.error("pivotMat: Failed to create pivot_matrix_candidate due to unexpected None state.")
+                return None
+            # --- MODIFICATION END ---
+
+            # --- 修正開始：確保 pivot_matrix 是 2D 且形狀正確 ---
+            if current_rank == 1:
+                if pivot_matrix_candidate.shape() == [1]:
+                    pivot_matrix = pivot_matrix_candidate.reshape(1, 1)
+                elif pivot_matrix_candidate.shape() == [current_rank, current_rank]:
+                    pivot_matrix = pivot_matrix_candidate
+                else:
+                    logger.warning(f"pivotMat: Rank 1 pivot_matrix_candidate shape is {pivot_matrix_candidate.shape()}, expected [1] or [1,1]. Returning None.")
+                    return None
+            elif pivot_matrix_candidate.rank() == 2 and \
+                 pivot_matrix_candidate.shape()[0] == current_rank and \
+                 pivot_matrix_candidate.shape()[1] == current_rank:
+                pivot_matrix = pivot_matrix_candidate
+            else:
+                logger.warning(f"pivotMat: Resulting pivot_matrix_candidate shape {pivot_matrix_candidate.shape()} "
+                               f"is not 2D or not rank x rank ({current_rank}x{current_rank}). Returning None.")
+                return None
+            # --- 修正結束 ---
+
+            logger.debug(f"pivotMat: Successfully created pivot matrix of shape: {pivot_matrix.shape()}")
+            return pivot_matrix
+        except Exception as e:
+            logger.error(f"pivotMat: Error: {e}", exc_info=True)
+            return None
 
     def pivotMat(self) -> Optional[Tensor]:
         if self.C is None or not isinstance(self.lu.Iset, (list, tuple)) or not self.lu.Iset:
@@ -166,7 +280,7 @@ class CrossData:
             self.R = row_2d
         else:
             if self.R.shape()[1] != row_2d.shape()[1]:
-                logger.error(f"addPivotRow: Mismatch in columns for vstack. R_cols: {self.R.shape()[1]}, row_cols: {row_2d.shape()[1]}"); return
+                raise ValueError(f"addPivotRow: Mismatch in columns for vstack. R_cols: {self.R.shape()[1]}, row_cols: {row_2d.shape()[1]}")
             self.R = manual_vstack(self.R, row_2d)
         logger.debug(f"addPivotRow: Updated R, new shape: {self.R.shape()}.")
 
@@ -210,7 +324,7 @@ class CrossData:
             self.C = col_2d
         else:
             if self.C.shape()[0] != col_2d.shape()[0]:
-                logger.error(f"addPivotCol: Mismatch in rows for hstack. C_cols: {self.C.shape()[0]}, col_rows: {col_2d.shape()[0]}"); return
+                raise ValueError(f"addPivotCol: Mismatch in rows for hstack. C_cols: {self.C.shape()[0]}, col_rows: {col_2d.shape()[0]}")
             self.C = manual_hstack(self.C, col_2d)
         logger.debug(f"addPivotCol: Updated C, new shape: {self.C.shape()}.")
 

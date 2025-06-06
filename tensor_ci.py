@@ -676,7 +676,49 @@ class TensorCI1:
             p1t_core = self.get_P1T_at(p_bond + 1) # This was the line causing error previously
             if p1t_core and (p_bond + 1) < len(self.param.weight):
                 self.tt_sum_env.update_site(p_bond + 1, p1t_core, self.param.weight[p_bond+1], False)
-                                            
+    def _sync_cross_data_and_replay_pivots(self, p_bond: int):
+        """
+        Synchronizes a CrossData object with its underlying lazy matrix by
+        re-creating it and re-playing the existing pivots. This ensures
+        all internal matrices (C, R, L, U) have dimensions consistent
+        with the (potentially resized) lazy matrix.
+        """
+        if not (0 <= p_bond < len(self.P_cross_data)):
+            return
+
+        cross_data_obj = self.P_cross_data[p_bond]
+        lazy_matrix_obj = self.mat_lazy_Pi_at[p_bond]
+
+        if cross_data_obj is None or lazy_matrix_obj is None:
+            return
+
+        # If dimensions are out of sync, we must rebuild.
+        if (cross_data_obj.n_rows != lazy_matrix_obj.n_rows or
+            cross_data_obj.n_cols != lazy_matrix_obj.n_cols):
+
+            logger.info(f"Syncing CrossData for bond {p_bond}: "
+                        f"Dims changed from ({cross_data_obj.n_rows},{cross_data_obj.n_cols}) "
+                        f"to ({lazy_matrix_obj.n_rows},{lazy_matrix_obj.n_cols}). Rebuilding...")
+
+            # 1. Save the history of pivots
+            old_Iset = cross_data_obj.lu.Iset[:]
+            old_Jset = cross_data_obj.lu.Jset[:]
+
+            # 2. Create a brand new CrossData object with the correct, current dimensions
+            new_cross_data = CrossData(lazy_matrix_obj.n_rows, lazy_matrix_obj.n_cols)
+            new_cross_data.tol = self.param.reltol # Preserve tolerance setting
+
+            # 3. Re-play the pivots onto the new object
+            if old_Iset and old_Jset:
+                logger.debug(f"  Re-playing {len(old_Iset)} pivots...")
+                for i_piv, j_piv in zip(old_Iset, old_Jset):
+                    # addPivot will call the necessary sub-methods to build up C, R, and the new lu object's L,U,D
+                    new_cross_data.addPivot(i_piv, j_piv, lazy_matrix_obj)
+                logger.debug("  Re-play complete.")
+
+            # 4. Replace the old, out-of-sync object with the new, correct one
+            self.P_cross_data[p_bond] = new_cross_data
+
     def iterate_one_full_sweep(self, update_M_data: bool = True) -> float:
         logger.info("Starting iterate_one_full_sweep...")
         max_pivot_error_sweep = 0.0
@@ -694,6 +736,10 @@ class TensorCI1:
             for p_bond in bond_iter:
                 logger.debug(f"      Processing bond {p_bond} ({sweep_name})")
                 
+                # --- START OF THE DEFINITIVE FIX ---
+                self._sync_cross_data_and_replay_pivots(p_bond)
+                # --- END OF THE DEFINITIVE FIX ---
+
                 if self.pivFinder[p_bond] is None or self.mat_lazy_Pi_at[p_bond] is None or self.P_cross_data[p_bond] is None:
                     logger.warning(f"Skipping bond {p_bond} in {sweep_name} sweep: critical component None.")
                     continue
@@ -712,7 +758,13 @@ class TensorCI1:
 
                 # 1. Update P_cross_data
                 logger.debug(f"      Adding pivot ({pivot_data.i}, {pivot_data.j}) for P_cross_data[{p_bond}] with error {pivot_data.error:.2e}") # DEBUG
-                self.P_cross_data[p_bond].addPivot(pivot_data.i, pivot_data.j, self.mat_lazy_Pi_at[p_bond])
+                try:
+                    self.P_cross_data[p_bond].addPivot(pivot_data.i, pivot_data.j, self.mat_lazy_Pi_at[p_bond])
+                except ValueError as e:
+                    logger.error(f"A dimension mismatch error occurred while adding pivot for bond {p_bond}, even after sync. This should not happen. Error: {e}")
+                    # Decide how to handle this. Maybe stop the sweep?
+                    break # Stop processing this sweep
+
                 logger.debug(f"      P_cross_data[{p_bond}] rank after update: {self.P_cross_data[p_bond].rank()}") # DEBUG
 
                 if update_M_data: # Corresponds to update_T_P_Iset_Jset
@@ -771,7 +823,6 @@ class TensorCI1:
         logger.info(f"Finished iterate_one_full_sweep. Max pivot error: {max_pivot_error_sweep:.4e}")
         return max_pivot_error_sweep
 
-
     def IterateN(self, n_iterations: int, update_M_data: bool = True):
         logger.info(f"TensorCI1.IterateN called for {n_iterations} iterations.")
         if self.D <= 1:
@@ -785,9 +836,8 @@ class TensorCI1:
                 logger.info(f"  Converged after {i+1} iterations."); self.done = True; break
         if not self.done and n_iterations > 0: logger.info(f"  Finished {n_iterations} iterations.")
 
-
+    
     def _update_tt_M_and_P_pivot_matrix_after_crossdata_update(self, p_bond: int):
-
 
         """
         Updates TT cores and P_pivot_matrices based on updated CrossData and global Iset/Jset.
@@ -849,36 +899,35 @@ class TensorCI1:
             else:
                 logger.error(f"  Shape mismatch C_matrix for T_cores[{p_bond}]. Expected {expected_C_shape}, Got {C_matrix.shape()}. Skipping update.")
         else: logger.warning(f"  C_matrix None for T_cores[{p_bond}]. Skipping update.")
-
-
-        # C. Update T_cores[p_bond+1] using cross_data_p.R
+         # C. Update T_cores[p_bond+1] using cross_data_p.R
         if (p_bond + 1) < self.D:
             R_matrix = cross_data_p.R
             if R_matrix is not None:
-                dim_I_pp1 = len(self.Iset[p_bond+1]) # Updated Iset
+                dim_I_pp1 = len(self.Iset[p_bond+1])
                 dim_phys_pp1 = self.phys_dims[p_bond+1]
-                dim_J_pp1 = len(self.Jset[p_bond+1]) # Updated Jset
+                dim_J_pp1 = len(self.Jset[p_bond+1])
 
-                # Check expected shape of R_matrix from CrossData: (dim_I_pp1, dim_phys_pp1 * dim_J_pp1)
-                expected_R_shape = (dim_I_pp1, dim_phys_pp1 * dim_J_pp1)
-                if R_matrix.shape() == list(expected_R_shape): # .shape() returns list
+                # --- START OF THE FIX ---
+                # Replace .elem_count() with np.prod(shape)
+                actual_elements = np.prod(R_matrix.shape())
+                expected_elements = dim_I_pp1 * dim_phys_pp1 * dim_J_pp1
+
+                if R_matrix.shape()[0] == dim_I_pp1 and actual_elements == expected_elements:
+                # --- END OF THE FIX ---
                     reshaped_R = R_matrix.reshape(dim_I_pp1, dim_phys_pp1, dim_J_pp1)
-
-                    label_L_pp1 = f'link{p_bond}' # Iset[p_bond+1] defines left link of T_cores[p_bond+1]
-                    label_P_pp1 = f'p{p_bond+1}'
-                    label_R_pp1 = f'link{p_bond+1}' if (p_bond+1) < self.D-1 else 'R_bound'
-
-                    bonds_pp1 = [cytnx.Bond(dim_I_pp1, cytnx.BD_IN),
-                                 cytnx.Bond(dim_phys_pp1, cytnx.BD_OUT),
-                                 cytnx.Bond(dim_J_pp1, cytnx.BD_OUT)]
-                    
+                    label_L_pp1, label_P_pp1, label_R_pp1 = (f'link{p_bond}', f'p{p_bond+1}', f'link{p_bond+1}' if (p_bond+1) < self.D-1 else 'R_bound')
+                    bonds_pp1 = [cytnx.Bond(dim_I_pp1, cytnx.BD_IN), cytnx.Bond(dim_phys_pp1, cytnx.BD_OUT), cytnx.Bond(dim_J_pp1, cytnx.BD_OUT)]
                     new_core_ut_pp1 = UniTensor(bonds=bonds_pp1, labels=[label_L_pp1, label_P_pp1, label_R_pp1], rowrank=1, is_diag=False)
                     new_core_ut_pp1.put_block(reshaped_R.astype(self.dtype).to(self.device))
                     self.tt.M[p_bond+1] = new_core_ut_pp1
-                    logger.debug(f"  T_cores[{p_bond+1}] updated to shape {self.tt.M[p_bond+1].shape()}.") # DEBUG
+                    logger.debug(f"  T_cores[{p_bond+1}] updated to shape {self.tt.M[p_bond+1].shape()}.")
                 else:
-                    logger.error(f"  Shape mismatch R_matrix for T_cores[{p_bond+1}]. Expected {expected_R_shape}, Got {R_matrix.shape()}. Skipping update.")
-            else: logger.warning(f"  R_matrix None for T_cores[{p_bond+1}]. Skipping update.")
+                    # Fix the logging message as well
+                    logger.error(f"  Shape/element count mismatch R_matrix for T_cores[{p_bond+1}]. R_shape: {R_matrix.shape()}, "
+                                 f"Expected elements based on new Jset: {expected_elements}. "
+                                 f"Actual elements: {actual_elements}. Skipping update.")
+            else:
+                logger.warning(f"  R_matrix None for T_cores[{p_bond+1}]. Skipping update.")
 
 
     def get_canonical_tt(self, center: int) -> TensorTrain:
