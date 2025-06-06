@@ -869,66 +869,70 @@ class TensorCI1:
         else:
             logger.error(f"Attempted to update P_pivot_matrices[{p_bond}] but index is out of bounds (len={len(self.P_pivot_matrices)}).")
 
-
-        # B. Update T_cores[p_bond] using cross_data_p.C
-        # T_cores[p_bond] shape (len(Iset[p_bond]), phys_dims[p_bond], len(Jset[p_bond]))
+        # B. 更新 T_cores[p_bond] using cross_data_p.C
         C_matrix = cross_data_p.C
         if C_matrix is not None:
-            dim_I_p = len(self.Iset[p_bond]) # Updated Iset
+            # ======================= 改善方案程式碼 START (C_matrix) =======================
+            dim_I_p = len(self.Iset[p_bond])
             dim_phys_p = self.phys_dims[p_bond]
-            dim_J_p = len(self.Jset[p_bond]) # Updated Jset (this is the new bond dimension)
             
-            # Check expected shape of C_matrix from CrossData: (dim_I_p * dim_phys_p, dim_J_p)
-            expected_C_shape = (dim_I_p * dim_phys_p, dim_J_p)
-            if C_matrix.shape() == list(expected_C_shape): # .shape() returns list, so compare to list
-                reshaped_C = C_matrix.reshape(dim_I_p, dim_phys_p, dim_J_p)
+            # 從 C_matrix 直接獲取真實的右鍵結維度 (rank)
+            dim_J_p_from_C = C_matrix.shape()[1]
+
+            # 檢查 C_matrix 的總行數是否與左側維度匹配
+            if C_matrix.shape()[0] != dim_I_p * dim_phys_p:
+                logger.error(f"  Shape mismatch C_matrix for T_cores[{p_bond}]. "
+                             f"Rows ({C_matrix.shape()[0]}) do not match expected ({dim_I_p * dim_phys_p}). Skipping update.")
+            else:
+                reshaped_C = C_matrix.reshape(dim_I_p, dim_phys_p, dim_J_p_from_C)
 
                 label_L = f'link{p_bond-1}' if p_bond > 0 else 'L_bound'
                 label_P = f'p{p_bond}'
-                label_R = f'link{p_bond}' # Jset[p_bond] defines the right link of T_cores[p_bond]
+                label_R = f'link{p_bond}'
 
                 bonds = [cytnx.Bond(dim_I_p, cytnx.BD_IN),
                          cytnx.Bond(dim_phys_p, cytnx.BD_OUT),
-                         cytnx.Bond(dim_J_p, cytnx.BD_OUT)]
+                         cytnx.Bond(dim_J_p_from_C, cytnx.BD_OUT)] # 使用從 C 推斷出的維度
                 
-                # Create UniTensor with updated bond dimensions and put block
                 new_core_ut_p = UniTensor(bonds=bonds, labels=[label_L, label_P, label_R], rowrank=1, is_diag=False)
                 new_core_ut_p.put_block(reshaped_C.astype(self.dtype).to(self.device))
                 self.tt.M[p_bond] = new_core_ut_p
-                logger.debug(f"  T_cores[{p_bond}] updated to shape {self.tt.M[p_bond].shape()}.") # DEBUG
-            else:
-                logger.error(f"  Shape mismatch C_matrix for T_cores[{p_bond}]. Expected {expected_C_shape}, Got {C_matrix.shape()}. Skipping update.")
-        else: logger.warning(f"  C_matrix None for T_cores[{p_bond}]. Skipping update.")
-         # C. Update T_cores[p_bond+1] using cross_data_p.R
+                logger.debug(f"  T_cores[{p_bond}] updated to shape {self.tt.M[p_bond].shape()}. (Robust Update C)")
+            # ======================= 改善方案程式碼 END (C_matrix) =======================
+        else:
+            logger.warning(f"  C_matrix None for T_cores[{p_bond}]. Skipping update.")
+
+        # C. 更新 T_cores[p_bond+1] using cross_data_p.R
         if (p_bond + 1) < self.D:
+            # 套用上一輪的修正
+            # ... (上一輪的 robust R_matrix update 程式碼應保留在此) ...
             R_matrix = cross_data_p.R
             if R_matrix is not None:
-                dim_I_pp1 = len(self.Iset[p_bond+1])
+                dim_I_pp1_from_R = R_matrix.shape()[0]
                 dim_phys_pp1 = self.phys_dims[p_bond+1]
-                dim_J_pp1 = len(self.Jset[p_bond+1])
 
-                # --- START OF THE FIX ---
-                # Replace .elem_count() with np.prod(shape)
-                actual_elements = np.prod(R_matrix.shape())
-                expected_elements = dim_I_pp1 * dim_phys_pp1 * dim_J_pp1
+                if R_matrix.shape()[1] % dim_phys_pp1 != 0:
+                     logger.error(f"  Shape mismatch R_matrix for T_cores[{p_bond+1}]. "
+                                  f"R_matrix columns ({R_matrix.shape()[1]}) cannot be divided by "
+                                  f"physical dimension ({dim_phys_pp1}). Skipping update.")
+                else:
+                    dim_J_pp1_from_R = R_matrix.shape()[1] // dim_phys_pp1
+                    reshaped_R = R_matrix.reshape(dim_I_pp1_from_R, dim_phys_pp1, dim_J_pp1_from_R)
+                    
+                    label_L_pp1 = f'link{p_bond}'
+                    label_P_pp1 = f'p{p_bond+1}'
+                    label_R_pp1 = f'link{p_bond+1}' if (p_bond+1) < self.D-1 else 'R_bound'
 
-                if R_matrix.shape()[0] == dim_I_pp1 and actual_elements == expected_elements:
-                # --- END OF THE FIX ---
-                    reshaped_R = R_matrix.reshape(dim_I_pp1, dim_phys_pp1, dim_J_pp1)
-                    label_L_pp1, label_P_pp1, label_R_pp1 = (f'link{p_bond}', f'p{p_bond+1}', f'link{p_bond+1}' if (p_bond+1) < self.D-1 else 'R_bound')
-                    bonds_pp1 = [cytnx.Bond(dim_I_pp1, cytnx.BD_IN), cytnx.Bond(dim_phys_pp1, cytnx.BD_OUT), cytnx.Bond(dim_J_pp1, cytnx.BD_OUT)]
+                    bonds_pp1 = [cytnx.Bond(dim_I_pp1_from_R, cytnx.BD_IN),
+                                 cytnx.Bond(dim_phys_pp1, cytnx.BD_OUT),
+                                 cytnx.Bond(dim_J_pp1_from_R, cytnx.BD_OUT)]
+
                     new_core_ut_pp1 = UniTensor(bonds=bonds_pp1, labels=[label_L_pp1, label_P_pp1, label_R_pp1], rowrank=1, is_diag=False)
                     new_core_ut_pp1.put_block(reshaped_R.astype(self.dtype).to(self.device))
                     self.tt.M[p_bond+1] = new_core_ut_pp1
-                    logger.debug(f"  T_cores[{p_bond+1}] updated to shape {self.tt.M[p_bond+1].shape()}.")
-                else:
-                    # Fix the logging message as well
-                    logger.error(f"  Shape/element count mismatch R_matrix for T_cores[{p_bond+1}]. R_shape: {R_matrix.shape()}, "
-                                 f"Expected elements based on new Jset: {expected_elements}. "
-                                 f"Actual elements: {actual_elements}. Skipping update.")
+                    logger.debug(f"  T_cores[{p_bond+1}] updated to shape {self.tt.M[p_bond+1].shape()}. (Robust Update R)")
             else:
                 logger.warning(f"  R_matrix None for T_cores[{p_bond+1}]. Skipping update.")
-
 
     def get_canonical_tt(self, center: int) -> TensorTrain:
         logger.info(f"Constructing canonical TensorTrain with center at {center}")
