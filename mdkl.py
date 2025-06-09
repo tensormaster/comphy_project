@@ -126,8 +126,8 @@ if __name__ == "__main__":
     DOMAIN = (0.0, 1.0)
     TCI_RELTOL = 1e-9
     TCI_QUAD_POINTS = 16
-    MC_SAMPLES_1 = 1_000_000
-    MC_SAMPLES_2 = 10_000_000
+    MC_SAMPLES_1 = 1_000
+    MC_SAMPLES_2 = 10_000
     
     # --- 理論參考值 ---
     # Integral of cos(pi/2 * x) from 0 to 1 is [2/pi * sin(pi/2*x)]_0^1 = 2/pi
